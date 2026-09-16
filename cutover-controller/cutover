@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from lib.config import Config, ConfigError
+from lib.controller import Controller, ControllerError
+from lib.pg import PostgreSQLError
+from lib.state import StateError, StateStore
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description="Safe PostgreSQL logical-replication cutover controller")
+    result.add_argument("--config", default=str(ROOT / "config.yaml"), help="YAML configuration file")
+    result.add_argument("--state-file", default=str(ROOT / "state" / "cutover-state.yaml"))
+    result.add_argument("--logs-dir", default=str(ROOT / "logs"))
+    result.add_argument("--verbose", action="store_true")
+    commands = result.add_subparsers(dest="command", required=True)
+
+    inventory = commands.add_parser("inventory", help="print forward publication tables for config review")
+    inventory.add_argument("--json", action="store_true")
+
+    precheck = commands.add_parser("precheck", help="validate the complete forward topology")
+    precheck.add_argument("--observe-seconds", type=float, default=10)
+    precheck.add_argument("--json", action="store_true")
+
+    status = commands.add_parser("status", help="show concise state-aware health")
+    status.add_argument("--json", action="store_true")
+
+    capture = commands.add_parser("capture-lsn", help="capture final SOURCE LSN after write freeze")
+    capture.add_argument("--confirm-source-writes-frozen", action="store_true")
+    capture.add_argument("--force", action="store_true")
+    capture.add_argument("--resume", action="store_true")
+
+    wait = commands.add_parser("wait-catchup", help="wait for all forward subscriptions")
+    wait.add_argument("--interval", type=float)
+    wait.add_argument("--timeout", type=float)
+
+    disable = commands.add_parser("disable-forward", help="disable caught-up forward subscriptions")
+    disable.add_argument("--dry-run", action="store_true")
+    disable.add_argument("--resume", action="store_true")
+    disable.add_argument("--ignore-missing", action="store_true")
+
+    sequences = commands.add_parser("sync-sequences", help="synchronize sequence state SOURCE to TARGET")
+    sequences.add_argument("--dry-run", action="store_true")
+    sequences.add_argument("--resume", action="store_true")
+
+    prepare = commands.add_parser("prepare-reverse", help="create reverse objects while writes are frozen")
+    prepare.add_argument("--dry-run", action="store_true")
+    prepare.add_argument("--resume", action="store_true")
+
+    enable = commands.add_parser("enable-reverse", help="enable reverse subscriptions before TARGET writes")
+    enable.add_argument("--dry-run", action="store_true")
+    enable.add_argument("--resume", action="store_true")
+
+    confirm = commands.add_parser("confirm-cutover", help="record the external switch to TARGET")
+    confirm.add_argument("--confirm-target-only-writable", action="store_true")
+
+    verify = commands.add_parser("verify-reverse", help="verify reverse topology and optional probe")
+    verify.add_argument("--test", action="store_true", help="use each database's configured test_table")
+    verify.add_argument("--test-table", help="dedicated schema.table probe table")
+    verify.add_argument("--timeout", type=float, default=60)
+    verify.add_argument("--json", action="store_true")
+
+    rollback_precheck = commands.add_parser("rollback-precheck", help="freeze TARGET, catch up OLD, sync sequences")
+    rollback_precheck.add_argument("--confirm-target-writes-frozen", action="store_true")
+    rollback_precheck.add_argument("--interval", type=float)
+    rollback_precheck.add_argument("--timeout", type=float)
+    rollback_precheck.add_argument("--resume", action="store_true")
+
+    rollback = commands.add_parser("rollback", help="disable reverse replication and release OLD")
+    rollback.add_argument("--dry-run", action="store_true")
+    rollback.add_argument("--resume", action="store_true")
+
+    finalize = commands.add_parser("finalize", help="plan or execute irreversible replication cleanup")
+    mode = finalize.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--plan", action="store_true")
+    mode.add_argument("--execute", action="store_true")
+    finalize.add_argument("--confirm-no-rollback", action="store_true")
+    finalize.add_argument("--dry-run", action="store_true")
+    finalize.add_argument("--resume", action="store_true")
+    finalize.add_argument("--json", action="store_true")
+    return result
+
+
+def logger_for(directory: str, verbose: bool) -> logging.Logger:
+    path = Path(directory).resolve()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path, 0o700)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    logfile = path / f"cutover-{stamp}-{os.getpid()}.log"
+    handler = logging.FileHandler(logfile, encoding="utf-8")
+    os.chmod(logfile, 0o600)
+    formatter = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
+    formatter.converter = __import__("time").gmtime
+    handler.setFormatter(formatter)
+    logger = logging.getLogger("cutover")
+    logger.handlers.clear()
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    logger.addHandler(handler)
+    logger.info("controller started log=%s", logfile)
+    return logger
+
+
+def main() -> int:
+    args = parser().parse_args()
+    logger = logger_for(args.logs_dir, args.verbose)
+    try:
+        config = Config.load(args.config)
+        store = StateStore(args.state_file, config)
+        with store.locked():
+            controller = Controller(config, store, ROOT / "sql", logger)
+            command = args.command
+            logger.info("command=%s status=starting", command)
+            if command == "inventory":
+                controller.inventory(args.json)
+            elif command == "precheck":
+                controller.precheck(args.observe_seconds, args.json)
+            elif command == "status":
+                controller.status(args.json)
+            elif command == "capture-lsn":
+                controller.capture_lsn(args.confirm_source_writes_frozen, args.force, args.resume)
+            elif command == "wait-catchup":
+                controller.wait_catchup(args.interval or config.poll_interval, args.timeout)
+            elif command == "disable-forward":
+                controller.disable_forward(args.dry_run, args.resume, args.ignore_missing)
+            elif command == "sync-sequences":
+                controller.sync_sequences(args.dry_run, args.resume)
+            elif command == "prepare-reverse":
+                controller.prepare_reverse(args.dry_run, args.resume)
+            elif command == "enable-reverse":
+                controller.enable_reverse(args.dry_run, args.resume)
+            elif command == "confirm-cutover":
+                controller.confirm_cutover(args.confirm_target_only_writable)
+            elif command == "verify-reverse":
+                controller.verify_reverse(args.test_table, args.test, args.timeout, args.json)
+            elif command == "rollback-precheck":
+                controller.rollback_precheck(
+                    args.confirm_target_writes_frozen,
+                    args.interval or config.poll_interval,
+                    args.timeout,
+                    args.resume,
+                )
+            elif command == "rollback":
+                controller.rollback(args.dry_run, args.resume)
+            elif command == "finalize" and args.plan:
+                controller.finalize_plan(args.json)
+            elif command == "finalize" and args.execute:
+                controller.finalize_execute(args.confirm_no_rollback, args.resume, args.dry_run)
+            logger.info("command=%s status=complete", command)
+        return 0
+    except ConfigError as exc:
+        logger.error("configuration error: %s", exc)
+        print(f"CONFIG ERROR: {exc}", file=sys.stderr)
+        return 3
+    except PostgreSQLError as exc:
+        logger.error("PostgreSQL error: %s", exc)
+        print(f"POSTGRESQL ERROR: {exc}", file=sys.stderr)
+        return 4
+    except (StateError, BlockingIOError) as exc:
+        logger.error("state error: %s", exc)
+        print(f"BLOCKED: {exc}", file=sys.stderr)
+        return 2
+    except ControllerError as exc:
+        logger.error("controller error: %s", exc)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return exc.exit_code
+    except KeyboardInterrupt:
+        logger.warning("interrupted")
+        print("Interrupted; state checkpoints were preserved. Use --resume where reported.", file=sys.stderr)
+        return 130
+    except Exception:
+        logger.exception("unexpected controller failure")
+        print("UNEXPECTED ERROR: inspect the controller log for details", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

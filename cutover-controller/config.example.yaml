@@ -1,0 +1,56 @@
+source:
+  host: old-db.example.com
+  port: 5432
+  user: migration_admin
+  sslmode: require
+  expected_system_identifier: "7412345678901234567"
+  # Optional controller login secret. Prefer ~/.pgpass when practical.
+  # password_env: CUTOVER_SOURCE_PASSWORD
+
+target:
+  host: new-db.example.com
+  port: 5432
+  user: migration_admin
+  sslmode: require
+  expected_system_identifier: "7498765432109876543"
+  # The OLD server-side reverse worker connects to NEW as this role.
+  replication_user: logical_replication
+  replication_password_env: CUTOVER_TARGET_REPLICATION_PASSWORD
+  # Optional controller login secret:
+  # password_env: CUTOVER_TARGET_PASSWORD
+
+settings:
+  poll_interval_seconds: 5
+  lock_timeout_seconds: 5
+  healthy_lag_bytes: 0
+
+databases:
+  - name: db01
+    forward_publication: pub_db01
+    forward_subscription: sub_db01
+    reverse_publication: pub_rev_db01
+    reverse_subscription: sub_rev_db01
+    # Optional. When omitted it is discovered from the forward subscription.
+    # forward_slot: sub_db01
+    # reverse_slot defaults to reverse_subscription.
+    reverse_slot: sub_rev_db01
+    expected_publish: [insert, update, delete, truncate]
+    expected_tables:
+      - schema: public
+        table: customers
+      - schema: public
+        table: orders
+      - schema: cutover_control
+        table: replication_probe
+    test_table:
+      schema: cutover_control
+      table: replication_probe
+
+  - name: db02
+    forward_publication: pub_db02
+    forward_subscription: sub_db02
+    reverse_publication: pub_rev_db02
+    reverse_subscription: sub_rev_db02
+    expected_tables:
+      - schema: public
+        table: accounts

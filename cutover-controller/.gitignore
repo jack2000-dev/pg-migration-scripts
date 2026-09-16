@@ -1,0 +1,9 @@
+config.yaml
+.venv/
+state/*
+!state/.gitkeep
+logs/*
+!logs/.gitkeep
+__pycache__/
+*.py[cod]
+.coverage

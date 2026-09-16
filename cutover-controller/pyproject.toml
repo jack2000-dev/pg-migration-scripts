@@ -1,0 +1,10 @@
+[project]
+name = "pg-cutover-controller"
+version = "0.1.0"
+description = "Safe PostgreSQL logical-replication cutover controller"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6.0,<7"]
+
+[tool.uv]
+package = false
