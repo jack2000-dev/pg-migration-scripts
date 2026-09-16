@@ -3,8 +3,28 @@
 This lab rehearses a PostgreSQL 17 to 18 logical-replication cutover and
 rollback across multiple databases:
 
-```text
-appctl/pgbench -> DigitalOcean PostgreSQL 17 -> OpenStack PostgreSQL 18
+```mermaid
+C4Container
+    title Cutover rehearsal lab
+
+    Person(operator, "Migration operator", "Runs the rehearsal from a terminal")
+    Container_Boundary(workstation, "Operator workstation") {
+        Container(appctl, "appctl", "Bash", "Starts, stops, and redirects the simulated workload")
+        Container(pgbench, "pgbench workers", "pgbench", "Generate writes for every configured database")
+        Container(controller, "Cutover controller", "Python / uv", "Checks safety gates and coordinates replication")
+    }
+    ContainerDb_Ext(source, "DigitalOcean PostgreSQL 17", "PostgreSQL", "Source writer before cutover")
+    ContainerDb_Ext(target, "OpenStack PostgreSQL 18", "PostgreSQL", "Target writer after cutover")
+
+    Rel(operator, appctl, "Controls workload")
+    Rel(operator, controller, "Runs cutover and rollback commands")
+    Rel(appctl, pgbench, "Starts, stops, and redirects")
+    Rel(pgbench, source, "Writes before cutover", "PostgreSQL / TLS")
+    Rel(pgbench, target, "Writes after cutover", "PostgreSQL / TLS")
+    Rel(controller, source, "Validates and manages", "psql / TLS")
+    Rel(controller, target, "Validates and manages", "psql / TLS")
+    Rel(source, target, "Forward logical replication")
+    Rel(target, source, "Rollback logical replication")
 ```
 
 All operational steps use terminal `psql`. pgAdmin is optional and should be
