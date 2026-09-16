@@ -1,152 +1,300 @@
-# Cutover lab runbook
+# PostgreSQL cutover lab
 
-This directory rehearses the existing `../cutover-controller` against two
-databases in one PostgreSQL 17 -> 18 cluster pair. Read `PLAN.md` before using
-it. Nothing here provisions or destroys cloud infrastructure.
+This lab rehearses a PostgreSQL 17 to 18 logical-replication cutover and
+rollback across multiple databases:
 
-## 1. Prerequisites
-
-- Existing DigitalOcean Managed PostgreSQL 17 source and OpenStack PostgreSQL
-  18 target.
-- Bidirectional TLS connectivity between the database services and controller
-  connectivity to both.
-- `bash`, `psql`, `pgbench`, `uv`, and pgAdmin 4.
-- A mode-0600 `.pgpass` covering the app and validation accounts. The reverse
-  replication password remains in the environment required by the controller.
-- DigitalOcean and target CA certificates. The controller does not have a
-  YAML `sslrootcert` field, so install its CA in libpq's default certificate
-  location or system trust store before using `sslmode: verify-full`.
-
-Copy the runtime configuration and protect it:
-
-```bash
-cd labs
-cp config.example.env config.env
-cp cutover.example.yaml cutover.yaml
-chmod 600 config.env cutover.yaml
+```text
+appctl/pgbench -> DigitalOcean PostgreSQL 17 -> OpenStack PostgreSQL 18
 ```
 
-Fill both files, then run the local checks:
+All operational steps use terminal `psql`. pgAdmin is optional and should be
+used only for read-only inspection. This lab does not provision cloud
+infrastructure. Read `PLAN.md` before running a cutover.
+
+## Prerequisites
+
+- A DigitalOcean PostgreSQL 17 source and OpenStack PostgreSQL 18 target.
+- The same database names created on both clusters.
+- Logical replication enabled with enough slots, WAL senders, and workers.
+- Network access in both directions: target to source for forward replication,
+  and source to target for rollback replication.
+- TLS CA certificates available to each connection initiator.
+- `bash`, `psql`, a working `pgbench`, and `uv`.
+- Provider/admin accounts that can create roles, publications, subscriptions,
+  and replication slots.
+
+## Installation
+
+From the repository root:
+
+```bash
+cd cutover-controller
+uv sync --locked
+cd ../labs
+
+psql --version
+pgbench --version
+../cutover-controller/.venv/bin/python --version
+```
+
+`pgbench --version` must succeed. Some operating-system client packages install
+only a wrapper; install the package containing the real binary if it fails.
+
+Create protected runtime configuration:
+
+```bash
+mkdir -p local
+chmod 700 local
+cp config.example.env local/config.env
+cp cutover.example.yaml local/cutover.yaml
+chmod 600 local/config.env local/cutover.yaml
+```
+
+`local/`, `.state/`, and logs are ignored by Git.
+
+## Configuration
+
+Edit `local/config.env`:
+
+- `LAB_DATABASES`: comma-separated database names.
+- `LAB_APP_USER`: simulated application login.
+- `SOURCE_VALIDATION_USER` and `TARGET_VALIDATION_USER`: controller/admin
+  logins used by the terminal helpers.
+- `SOURCE_REPLICATION_USER` and `TARGET_REPLICATION_USER`: forward and reverse
+  logical-replication logins.
+- `SOURCE_*` and `TARGET_*`: host, port, `sslmode`, and local CA path.
+- `LAB_ACCOUNT_COUNT`, `LAB_CLIENTS`, and `LAB_TPS`: workload size.
+
+If `local/config.env` already existed before the psql conversion, add:
+
+```bash
+SOURCE_REPLICATION_USER=lab_forward_repl
+TARGET_REPLICATION_USER=lab_reverse_repl
+```
+
+Edit `local/cutover.yaml`:
+
+- Set endpoints, users, SSL modes, and system identifiers.
+- Add one `databases` entry per database.
+- Give every publication, subscription, and slot a unique name.
+- Keep the four sample `expected_tables` for the supplied lab schema.
+- Set password environment-variable names; never put passwords in YAML.
+- Make `target.replication_user` match `TARGET_REPLICATION_USER`.
+
+`LAB_DATABASES` must exactly match every `databases[].name`. `source` and
+`target` are endpoint roles, not database names. Every database must exist with
+the same name on both clusters.
+
+The YAML `&lab_tables` and `*lab_tables` values only reuse the table list.
+
+### Passwords and TLS
+
+Use `~/.pgpass` for application, validation, and controller connections:
+
+```text
+hostname:port:database:username:password
+```
+
+Add an entry for each endpoint, database, and user, then run:
+
+```bash
+chmod 600 ~/.pgpass
+```
+
+Before controller commands, export every password variable named in
+`local/cutover.yaml`. Prompt silently so secrets do not enter shell history:
+
+```bash
+read -rsp 'Target replication password: ' CUTOVER_TARGET_REPLICATION_PASSWORD
+export CUTOVER_TARGET_REPLICATION_PASSWORD
+printf '\n'
+```
+
+For controller connections using `sslmode: verify-full`, install both CAs in
+the system/libpq trust store or point `PGSSLROOTCERT` to a combined CA file.
+For subscription connections, CA paths are resolved on the PostgreSQL
+subscriber host, not this controller machine.
+
+## Quickstart
+
+Run everything below from `labs/`.
+
+### 1. Load configuration and helpers
 
 ```bash
 ./appctl check
+
+set -a
+source local/config.env
+set +a
+: "${SOURCE_REPLICATION_USER:?add SOURCE_REPLICATION_USER to local/config.env}"
+: "${TARGET_REPLICATION_USER:?add TARGET_REPLICATION_USER to local/config.env}"
+IFS=, read -r -a databases <<< "$LAB_DATABASES"
+
+source_psql() {
+  PGHOST="$SOURCE_HOST" PGPORT="$SOURCE_PORT" \
+  PGUSER="$SOURCE_VALIDATION_USER" PGSSLMODE="$SOURCE_SSLMODE" \
+  PGSSLROOTCERT="$SOURCE_SSLROOTCERT" \
+    psql -X -v ON_ERROR_STOP=1 "$@"
+}
+
+target_psql() {
+  PGHOST="$TARGET_HOST" PGPORT="$TARGET_PORT" \
+  PGUSER="$TARGET_VALIDATION_USER" PGSSLMODE="$TARGET_SSLMODE" \
+  PGSSLROOTCERT="$TARGET_SSLROOTCERT" \
+    psql -X -v ON_ERROR_STOP=1 "$@"
+}
+
+cutover_lab() {
+  ../cutover-controller/.venv/bin/python ../cutover-controller/cutover \
+    --config local/cutover.yaml \
+    --state-file .state/cutover-state.yaml \
+    --logs-dir logs "$@"
+}
+```
+
+These functions last for the current shell. Reload them after opening a new
+terminal.
+
+Validate the controller YAML without connecting:
+
+```bash
 ../cutover-controller/.venv/bin/python - <<'PY'
 from pathlib import Path
 import sys
 sys.path.insert(0, str(Path('../cutover-controller').resolve()))
 from lib.config import Config
-Config.load('cutover.yaml')
+Config.load('local/cutover.yaml')
 print('cutover config OK')
 PY
 ```
 
-## 2. Database capability gate
+### 2. Check capabilities and create roles
 
-Run `sql/capabilities.sql` in pgAdmin Query Tool on one database in each
-cluster. Record the output. The following are hard blockers:
-
-- `system_identifier_access` is false;
-- source `create_subscription_member` is false;
-- either publisher has `wal_level` other than `logical`;
-- projected slot, sender, logical-worker, or worker-process use has no reserve.
-
-Also prove target -> source and source -> target connections using the exact
-replication users, TLS mode, and firewall/trusted-source rules. Do not proceed
-if the managed PostgreSQL 17 source cannot create the reverse subscription.
-
-## 3. Roles, databases, and schema
-
-In `sql/roles.sql`, run the common statements plus only the block labelled for
-that cluster. `doadmin` and `migration_admin` match the example controller
-configuration; change those grant targets if the actual controller users have
-different names. Set passwords outside the saved SQL.
-
-Create `lab_db1` and `lab_db2` on both clusters. For each of the four
-databases, apply the schema with `psql` as the relevant admin:
+Create every configured database on both clusters using the provider tools.
+Use the first database for cluster-level checks:
 
 ```bash
-psql "service=source dbname=lab_db1" -X -v ON_ERROR_STOP=1 -f sql/schema.sql
-psql "service=source dbname=lab_db2" -X -v ON_ERROR_STOP=1 -f sql/schema.sql
-psql "service=target dbname=lab_db1" -X -v ON_ERROR_STOP=1 -f sql/schema.sql
-psql "service=target dbname=lab_db2" -X -v ON_ERROR_STOP=1 -f sql/schema.sql
+admin_database=${databases[0]}
+source_psql --dbname "$admin_database" -f sql/capabilities.sql
+target_psql --dbname "$admin_database" -f sql/capabilities.sql
 ```
 
-Uncomment and execute the labelled replication-role grants from `schema.sql`
-on the applicable cluster. Seed only the source:
+Record both system identifiers in `local/cutover.yaml`. Stop if logical
+replication, reverse-subscription permission, network access, or capacity is
+insufficient.
+
+Create lab roles once per cluster:
 
 ```bash
-psql "service=source dbname=lab_db1" -X -v ON_ERROR_STOP=1 \
-  -v account_count=10000 -f sql/seed.sql
-psql "service=source dbname=lab_db2" -X -v ON_ERROR_STOP=1 \
-  -v account_count=10000 -f sql/seed.sql
+source_psql --dbname "$admin_database" \
+  -v admin_role="$SOURCE_VALIDATION_USER" \
+  -v replication_role="$SOURCE_REPLICATION_USER" \
+  -v create_replication_role=true -f sql/roles.sql
+
+target_psql --dbname "$admin_database" \
+  -v admin_role="$TARGET_VALIDATION_USER" \
+  -v replication_role="$TARGET_REPLICATION_USER" \
+  -v create_replication_role=true -f sql/roles.sql
 ```
 
-## 4. Forward logical replication
+If DigitalOcean supplies the source replication identity and rejects custom
+`REPLICATION` roles, set `SOURCE_REPLICATION_USER` to that identity and run the
+source command with `create_replication_role=false`. Set login passwords
+outside saved SQL.
 
-Open `sql/forward-replication.sql` in pgAdmin Query Tool. Replace connection
-placeholders in a temporary editor buffer, then execute one labelled block at
-a time against the database and cluster named in its heading. Do not execute
-the whole file on one connection.
-
-Verify the target subscriptions without exposing connection strings:
-
-```sql
-SELECT subname, subenabled, subslotname, subpublications
-FROM pg_subscription ORDER BY subname;
-
-SELECT srsubstate, count(*)
-FROM pg_subscription_rel GROUP BY srsubstate ORDER BY srsubstate;
-```
-
-Prepare a shell helper for the existing controller. Its global options must
-come before each subcommand:
+### 3. Initialize schema and source data
 
 ```bash
-cutover_lab() {
-  (cd ../cutover-controller && uv run ./cutover \
-    --config ../labs/cutover.yaml \
-    --state-file ../labs/.state/cutover-state.yaml \
-    --logs-dir ../labs/logs "$@")
-}
+for database in "${databases[@]}"; do
+  source_psql --dbname "$database" \
+    -v replication_role="$SOURCE_REPLICATION_USER" -f sql/schema.sql
+
+  target_psql --dbname "$database" \
+    -v replication_role="$TARGET_REPLICATION_USER" -f sql/schema.sql
+
+  source_psql --dbname "$database" \
+    -v account_count="$LAB_ACCOUNT_COUNT" -f sql/seed.sql
+done
 ```
 
-Start concurrent traffic and wait for initial copy:
+### 4. Create forward replication
+
+Repeat this block for each `databases` entry in `local/cutover.yaml`. Paste the
+four object names from the same entry:
+
+```bash
+read -rp 'Database name: ' database
+read -rp 'Forward publication: ' publication
+read -rp 'Forward subscription: ' subscription
+read -rp 'Forward slot: ' slot
+
+source_psql --dbname "$database" -v publication="$publication" \
+  -f sql/create-publication.sql
+
+read -rsp 'Forward source conninfo: ' FORWARD_SOURCE_CONNINFO
+export FORWARD_SOURCE_CONNINFO
+printf '\n'
+target_psql --dbname "$database" \
+  -v subscription="$subscription" -v publication="$publication" \
+  -v slot="$slot" -f sql/create-subscription.sql
+unset FORWARD_SOURCE_CONNINFO
+```
+
+The hidden conninfo prompt expects the complete target-to-source connection:
+
+```text
+host=SOURCE_HOST port=SOURCE_PORT dbname=DATABASE user=REPLICATION_USER password=PASSWORD sslmode=SSLMODE
+```
+
+Add `sslrootcert=/path/on/target/host/ca.crt` for verified TLS. The secret is
+passed through the environment, not shell history or command arguments, but
+PostgreSQL stores it in the protected subscription catalog.
+
+Verify each target database:
+
+```bash
+target_psql --dbname "$database" --command \
+  'SELECT subname, subenabled, subslotname, subpublications FROM pg_subscription ORDER BY subname'
+target_psql --dbname "$database" --command \
+  'SELECT srsubstate, count(*) FROM pg_subscription_rel GROUP BY srsubstate ORDER BY srsubstate'
+```
+
+### 5. Start traffic and wait for initial copy
 
 ```bash
 ./appctl point source
 ./appctl start
 ./appctl status
+cutover_lab inventory
 cutover_lab precheck
 ```
 
-`precheck` must show both databases ready. Re-run it after resolving any lag,
-table-state, schema, identity, slot, or capacity error.
+Do not continue until every configured database and subscription table is
+healthy.
 
-## 5. Cutover
+## Cutover rehearsal
 
-Freeze routine DDL on both clusters with `sql/freeze-ddl.sql`. Then perform the
-cooperative application freeze:
+Run `sql/freeze-ddl.sql` through `source_psql` and `target_psql`, then stop app
+writes:
 
 ```bash
+source_psql --dbname "$admin_database" -f sql/freeze-ddl.sql
+target_psql --dbname "$admin_database" -f sql/freeze-ddl.sql
 ./appctl stop
 ./appctl status
 cutover_lab precheck
 ./validate
 ```
 
-Both workers must be `STOPPED`, precheck must pass, and validation must print
-`MATCH` for both databases. Capture each database's final WAL boundary and
-wait for both subscriptions:
+Every worker must be `STOPPED`, `precheck` must pass, and every database must
+print `MATCH`. Then:
 
 ```bash
 cutover_lab capture-lsn --confirm-source-writes-frozen
 cutover_lab wait-catchup --timeout 1800
 ./validate
-```
 
-Do not continue on a mismatch. With both sides still quiet:
-
-```bash
 cutover_lab disable-forward --dry-run
 cutover_lab disable-forward
 cutover_lab sync-sequences --dry-run
@@ -157,7 +305,7 @@ cutover_lab enable-reverse --dry-run
 cutover_lab enable-reverse
 ```
 
-Only after reverse workers and slots are active may traffic move:
+Redirect only after reverse replication is active:
 
 ```bash
 ./appctl point target
@@ -167,52 +315,43 @@ cutover_lab verify-reverse --test
 cutover_lab status
 ```
 
-Let the generator run, then stop it and wait until reverse replication is
-caught up (`cutover_lab status` reports both databases healthy) before using
-`./validate` as an exact comparison.
-
-## 6. Defensive database freeze drill
-
-This drill proves safety when the application does not cooperate:
-
-1. Point to source and start the generator.
-2. Run `sql/freeze-source.sql` on source as `doadmin`.
-3. Confirm `remaining_app_sessions` is zero and the app logs show repeated
-   authentication failures under `.state/logs/`.
-4. Sample `pg_current_wal_lsn()` twice while no other workload runs; it must
-   not advance because of the lab application.
-5. Run the controller capture only after its transaction check is clear.
-
-The supervisor intentionally retries `pgbench`; it does not silently turn an
-enforced database freeze into an apparent application stop.
-
-## 7. Rollback
-
-Freeze target traffic and let the controller establish the reverse boundary:
+## Rollback rehearsal
 
 ```bash
 ./appctl stop
 cutover_lab rollback-precheck --confirm-target-writes-frozen --timeout 1800
 cutover_lab rollback --dry-run
 cutover_lab rollback
-```
-
-If the defensive drill disabled source login, first ensure target `lab_app`
-cannot write, then run `ALTER ROLE lab_app LOGIN` on source. Redirect and
-verify source operation:
-
-```bash
 ./appctl point source
 ./appctl start
 ./appctl status
 ```
 
-Stop once more and compare both sides after any required catch-up. Confirm the
-first post-rollback `transfer_id` is unique and beyond the prior source value.
+If the defensive freeze disabled `lab_app`, ensure target writes are stopped
+before running `ALTER ROLE lab_app LOGIN` on source. Stop traffic after the
+test, run `./validate`, and confirm the first new `transfer_id` does not
+collide.
 
-## 8. Local checks
+## Optional defensive freeze drill
 
-These checks require no database:
+With `appctl` writing to source, run:
+
+```bash
+source_psql --dbname "$admin_database" -f sql/freeze-source.sql
+```
+
+Confirm `remaining_app_sessions` is zero, `.state/logs/` shows failed
+reconnects, and source WAL stops advancing before acknowledging the freeze.
+
+## What to do with pgAdmin
+
+pgAdmin is not required. Keep it only as an optional read-only viewer for
+schemas, sessions, replication slots, and status views. Do not use it for lab
+setup, cutover, rollback, or saved SQL containing credentials.
+
+## Local tests
+
+These checks do not connect to a database:
 
 ```bash
 bash -n appctl validate tests/test_appctl.sh
@@ -220,5 +359,6 @@ bash -n appctl validate tests/test_appctl.sh
 (cd ../cutover-controller && uv run python -m unittest discover -s tests -v)
 ```
 
-Use a fresh initialized lab to rehearse irreversible `finalize`; do not run it
-on the state used for the rollback exercise.
+Generator logs are in `.state/logs/`, controller logs are in `logs/`, and
+controller state is `.state/cutover-state.yaml`. Keep the state file for
+`--resume`; use a fresh lab and state file for irreversible `finalize` drills.

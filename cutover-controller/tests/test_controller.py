@@ -83,6 +83,16 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "cluster-wide unique"):
             self.load(text)
 
+    def test_non_string_identifiers_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "non-empty string"):
+            self.load(config_text().replace("host: old.example", "host: [old.example]", 1))
+        with self.assertRaisesRegex(ConfigError, "non-empty string"):
+            self.load(config_text().replace(
+                "forward_subscription: sub_db01",
+                "forward_subscription: 123",
+                1,
+            ))
+
     def test_non_finite_poll_interval_is_rejected(self) -> None:
         with self.assertRaisesRegex(ConfigError, "poll interval"):
             self.load(config_text() + "\nsettings:\n  poll_interval_seconds: .nan\n")
@@ -149,11 +159,17 @@ class PsqlBoundaryTests(unittest.TestCase):
         psql = Psql(endpoint, ROOT / "sql", logging.getLogger("test"))
         identity = {
             "database": "other", "system_identifier": "1", "server_version_num": 170000,
-            "server_version": "17", "in_recovery": False,
+            "server_version": "17", "in_recovery": False, "user": "admin",
         }
         with patch.object(psql, "identity", return_value=identity):
             with self.assertRaisesRegex(PostgreSQLError, "unexpected database"):
                 psql.validate_identity("db")
+        identity["database"] = "db"
+        identity["user"] = "other"
+        with patch.object(psql, "identity", return_value=identity):
+            with self.assertRaisesRegex(PostgreSQLError, "unexpected user"):
+                psql.validate_identity("db")
+        identity["user"] = "admin"
         identity["database"] = "db"
         identity["in_recovery"] = True
         with patch.object(psql, "identity", return_value=identity):
@@ -171,6 +187,12 @@ class StateAndBatchTests(unittest.TestCase):
         self.state = StateStore(Path(self.directory.name) / "state.yaml", self.config)
         self.state.load()
         self.controller = Controller(self.config, self.state, ROOT / "sql", logging.getLogger("test"))
+
+    def test_state_directory_is_forced_private(self) -> None:
+        os.chmod(self.state.path.parent, 0o755)
+        self.state.save()
+        mode = stat.S_IMODE(self.state.path.parent.stat().st_mode)
+        self.assertEqual(mode, 0o700)
 
     def test_atomic_state_has_private_permissions(self) -> None:
         self.state.save()
@@ -218,6 +240,41 @@ class StateAndBatchTests(unittest.TestCase):
         with self.assertRaisesRegex(StateError, "writer is invalid"):
             StateStore(self.state.path, self.config).load()
 
+    def test_published_column_cannot_target_generated_column(self) -> None:
+        db = self.config.databases[0]
+        publisher = {
+            "tables": [{
+                "schema": "public", "table": "things", "replica_identity": "f",
+                "identity_columns": [],
+                "columns": [{
+                    "name": "value", "type": "integer", "not_null": False,
+                    "has_default": False, "generated": "", "identity": "",
+                }],
+            }],
+            "sequences": [],
+        }
+        subscriber = {
+            "tables": [{
+                "schema": "public", "table": "things", "replica_identity": "f",
+                "identity_columns": [],
+                "columns": [{
+                    "name": "value", "type": "integer", "not_null": False,
+                    "has_default": False, "generated": "s", "identity": "",
+                }],
+            }],
+            "sequences": [],
+        }
+        published = [{
+            "schemaname": "public", "tablename": "things", "attnames": ["value"]
+        }]
+        with patch.object(
+            self.controller, "_schema_snapshot", side_effect=[publisher, subscriber]
+        ):
+            with self.assertRaisesRegex(Exception, "generated subscriber column"):
+                self.controller._check_direction(
+                    db, published, self.controller.source, self.controller.target
+                )
+
     def test_missing_published_manifest_is_a_controlled_error(self) -> None:
         table_row = {
             "schema": "public", "table": "things", "columns": [],
@@ -255,6 +312,7 @@ class StateAndBatchTests(unittest.TestCase):
             },
             "relations": [{"schemaname": "public", "tablename": "things"}],
             "not_ready_count": 0,
+            "origin": {"external_id": "pg_1"},
             "workers": [{"worker_type": "apply", "relid": None}],
         }
         with (
@@ -268,7 +326,65 @@ class StateAndBatchTests(unittest.TestCase):
             subscriber["subscription"]["subpublications"] = [db.reverse_publication, "unexpected"]
             problems, _, _ = self.controller._reverse_status(db, require_active=True)
             self.assertIn("reverse subscription publication differs", problems)
+            subscriber["origin"] = None
+            problems, _, _ = self.controller._reverse_status(db, require_active=True)
+            self.assertIn("reverse replication origin missing", problems)
 
+
+    def test_forward_disabled_validator_requires_inactive_exact_topology(self) -> None:
+        db = self.config.databases[0]
+        self.state.database(db.name)["checkpoints"]["forward_slot"] = {"name": "forward_slot"}
+        self.state.set_phase(db.name, "FORWARD_DISABLED")
+        publication = {
+            "pubinsert": True, "pubupdate": True, "pubdelete": True,
+            "pubtruncate": True,
+        }
+        publisher = {
+            "publication": publication,
+            "tables": [{"schemaname": "public", "tablename": "things"}],
+            "slot": {
+                "slot_type": "logical", "plugin": "pgoutput", "database": db.name,
+                "active": False, "wal_status": "reserved",
+            },
+        }
+        subscriber = {
+            "subscription": {
+                "subenabled": False,
+                "subpublications": [db.forward_publication],
+                "subslotname": "forward_slot",
+            },
+            "relations": [{"schemaname": "public", "tablename": "things"}],
+            "workers": [],
+        }
+        with (
+            patch.object(self.controller, "_target_info", return_value=subscriber),
+            patch.object(self.controller, "_source_info", return_value=publisher),
+        ):
+            self.assertEqual(self.controller._forward_disabled_problems(db), [])
+            publisher["slot"] = None
+            self.assertIn("forward slot missing", self.controller._forward_disabled_problems(db))
+
+    def test_wait_catchup_rejects_zero_interval(self) -> None:
+        with self.assertRaisesRegex(Exception, "interval"):
+            self.controller.wait_catchup(0, None)
+
+    def test_wait_catchup_revalidates_an_existing_checkpoint(self) -> None:
+        for db in self.config.databases:
+            self.state.set_phase(db.name, "FINAL_LSN_CAPTURED", final_source_lsn="0/10")
+            self.state.set_phase(db.name, "FORWARD_CAUGHT_UP")
+        with (
+            patch.object(self.controller, "_validate_batch_identities"),
+            patch.object(self.controller, "_progress", return_value=(True, 0, "0/10")) as progress,
+        ):
+            self.controller.wait_catchup(1, 0)
+        self.assertEqual(progress.call_count, len(self.config.databases))
+
+    def test_rollback_requires_frozen_writer_state(self) -> None:
+        for db in self.config.databases:
+            self.state.set_phase(db.name, "ROLLBACK_SEQUENCES_SYNCED")
+        self.state.data["writer"] = "target"
+        with self.assertRaisesRegex(Exception, "writes to remain frozen"):
+            self.controller.rollback(True, False)
 
     def test_finalize_detaches_slots_before_dropping_subscriptions(self) -> None:
         for db in self.config.databases:

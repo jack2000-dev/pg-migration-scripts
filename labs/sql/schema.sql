@@ -1,6 +1,14 @@
--- Run in lab_db1 and lab_db2 on both clusters as an admin that may SET ROLE
--- lab_owner. Logical replication does not create schemas or tables.
+-- Run in every configured database on both clusters as an admin that may
+-- SET ROLE lab_owner. Logical replication does not create schemas or tables.
+\set ON_ERROR_STOP on
+\if :{?replication_role}
+\else
+\echo 'ERROR: pass -v replication_role=...'
+\quit 3
+\endif
+
 GRANT CONNECT ON DATABASE :"DBNAME" TO lab_app, lab_deployer;
+GRANT CREATE ON DATABASE :"DBNAME" TO lab_owner;
 GRANT CREATE ON SCHEMA public TO lab_owner;
 CREATE SCHEMA IF NOT EXISTS cutover_control AUTHORIZATION lab_owner;
 
@@ -42,12 +50,6 @@ GRANT USAGE ON SCHEMA public, cutover_control TO lab_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON
     public.accounts, public.transfers, public.event_log TO lab_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO lab_app;
-
--- Grant the applicable role on each cluster; ignore the statement for the
--- role that intentionally does not exist there.
--- SOURCE: GRANT USAGE ON SCHEMA public, cutover_control TO lab_forward_repl;
--- SOURCE: GRANT SELECT ON public.accounts, public.transfers, public.event_log,
---         cutover_control.replication_probe TO lab_forward_repl;
--- TARGET: GRANT USAGE ON SCHEMA public, cutover_control TO lab_reverse_repl;
--- TARGET: GRANT SELECT ON public.accounts, public.transfers, public.event_log,
---         cutover_control.replication_probe TO lab_reverse_repl;
+GRANT USAGE ON SCHEMA public, cutover_control TO :"replication_role";
+GRANT SELECT ON public.accounts, public.transfers, public.event_log,
+    cutover_control.replication_probe TO :"replication_role";

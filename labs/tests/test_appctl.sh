@@ -13,7 +13,7 @@ cleanup() {
 trap cleanup EXIT
 
 cat > "$TEST_DIR/config.env" <<'EOF'
-LAB_DATABASES=lab_db1,lab_db2
+LAB_DATABASES=alpha,beta
 LAB_APP_USER=lab_app
 SOURCE_VALIDATION_USER=source_validator
 TARGET_VALIDATION_USER=target_validator
@@ -63,11 +63,13 @@ run_appctl() {
         "$ROOT/appctl" "$@"
 }
 
-run_appctl check >/dev/null
+check_output=$(run_appctl check 2>&1)
+[[ "$check_output" == *"configuration OK: databases=alpha beta"* ]]
+[[ "$check_output" != *"warning:"* ]]
 run_appctl point source >/dev/null
 run_appctl start >/dev/null
 status=$(run_appctl status)
-[[ "$status" == *"lab_db1      RUNNING"* ]]
+[[ "$status" == *"alpha        RUNNING"* ]]
 if run_appctl point target >/dev/null 2>&1; then
     printf 'point target unexpectedly succeeded while workers were running\n' >&2
     exit 1

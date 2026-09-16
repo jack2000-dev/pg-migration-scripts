@@ -30,6 +30,7 @@ WITH user_tables AS (
              FROM pg_index AS i
              CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ordinality)
              JOIN pg_attribute AS a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+             AND k.ordinality <= i.indnkeyatts
              WHERE i.indrelid = t.oid
                AND ((t.relreplident = 'i' AND i.indisreplident)
                     OR (t.relreplident = 'd' AND i.indisprimary))

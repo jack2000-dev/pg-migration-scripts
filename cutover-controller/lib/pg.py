@@ -43,6 +43,8 @@ class Psql:
     def run(self, database: str, sql: str, *, read_only: bool = True, contains_secret: bool = False) -> str:
         env = os.environ.copy()
         env.update(self.endpoint.controller_environment())
+        env["PGOPTIONS"] = ""
+        env["PGCLIENTENCODING"] = "UTF8"
         command = [
             "psql", "-X", "--no-psqlrc", "--quiet", "--no-align", "--tuples-only",
             "--set", "ON_ERROR_STOP=1", "--dbname", database,
@@ -98,6 +100,10 @@ class Psql:
         if identity.get("database") != database:
             raise PostgreSQLError(
                 f"{self.endpoint.name}/{database}: connected to unexpected database {identity.get('database')!r}"
+            )
+        if identity.get("user") != self.endpoint.user:
+            raise PostgreSQLError(
+                f"{self.endpoint.name}/{database}: connected as unexpected user {identity.get('user')!r}"
             )
         actual = str(identity.get("system_identifier"))
         if actual != self.endpoint.system_identifier:

@@ -52,9 +52,13 @@ class StateStore:
         self.config = config
         self.data: dict[str, Any] = {}
 
+    def _ensure_private_directory(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.path.parent, 0o700)
+
     @contextmanager
     def locked(self) -> Iterator["StateStore"]:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_private_directory()
         self.lock_path.touch(mode=0o600, exist_ok=True)
         os.chmod(self.lock_path, 0o600)
         with self.lock_path.open("r+") as lock_file:
@@ -109,7 +113,7 @@ class StateStore:
 
     def save(self) -> None:
         self.data["updated_at"] = now()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_private_directory()
         fd, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
         try:
             os.fchmod(fd, 0o600)

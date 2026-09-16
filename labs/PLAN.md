@@ -19,19 +19,19 @@ Success means:
 - a failure in the second database blocks the batch and `--resume` recovers it.
 
 Infrastructure provisioning is out of scope. The two clusters must already
-exist. pgAdmin 4 Query Tool is used to run the reviewed initial-replication
-SQL; Bash, `psql`, and `pgbench` provide the lab harness.
+exist. Parameterized `psql` scripts create the reviewed initial-replication
+objects; Bash, `psql`, and `pgbench` provide the lab harness.
 
 ## Topology and lab data
 
 ```text
                                 before cutover
-  appctl/pgbench -> DO PG17 lab_db1 -> OpenStack PG18 lab_db1
-                 -> DO PG17 lab_db2 -> OpenStack PG18 lab_db2
+  appctl/pgbench -> DO PG17 database A -> OpenStack PG18 database A
+                 -> DO PG17 database B -> OpenStack PG18 database B
 
                                 after cutover
-  DO PG17 lab_db1 <- OpenStack PG18 lab_db1 <- appctl/pgbench
-  DO PG17 lab_db2 <- OpenStack PG18 lab_db2 <- appctl/pgbench
+  DO PG17 database A <- OpenStack PG18 database A <- appctl/pgbench
+  DO PG17 database B <- OpenStack PG18 database B <- appctl/pgbench
 ```
 
 Each database contains `accounts`, `transfers`, `event_log`, and the
@@ -75,12 +75,12 @@ self-managed PostgreSQL 17 source; the lab must not claim rollback protection.
 
 1. Create the five lab roles on each relevant cluster and set passwords
    outside the repository.
-2. Create `lab_db1` and `lab_db2`, apply `sql/schema.sql` on all four
-   databases, then apply `sql/seed.sql` on both source databases.
-3. In pgAdmin Query Tool, use `sql/forward-replication.sql` to create one
-   source publication and target subscription per database with unique slots.
-4. Copy `config.example.env` to `config.env` and
-   `cutover.example.yaml` to a protected runtime YAML. Fill endpoints,
+2. Create every configured database on both clusters, apply `sql/schema.sql`
+   on both sides, then apply `sql/seed.sql` on each source database.
+3. Use `sql/create-publication.sql` and `sql/create-subscription.sql` with
+   `psql` to create one forward pair per database with unique slots.
+4. Copy `config.example.env` to `local/config.env` and
+   `cutover.example.yaml` to `local/cutover.yaml`. Fill endpoints,
    system identifiers, and password environment names without embedding
    passwords.
 5. Run `appctl point source`, `appctl start`, and `appctl status`. Wait for
@@ -113,9 +113,9 @@ the redirect would leave target commits outside the rollback stream.
 1. **Application ignores the stop:** leave `appctl` running, execute
    `sql/freeze-source.sql`, and verify the app reconnects fail, its sessions
    are gone, and the source LSN stops advancing before confirming the freeze.
-2. **Second database unhealthy:** disable or break only `lab_db2`, verify the
-   controller fails closed, repair it, and rerun the reported command with
-   `--resume`.
+2. **Second database unhealthy:** disable or break only the second configured
+   database, verify the controller fails closed, repair it, and rerun the
+   reported command with `--resume`.
 3. **Schema drift:** add an incompatible test column on one target table and
    verify precheck or reverse preparation blocks; remove it through a reviewed
    repair rather than forcing the controller.
@@ -139,14 +139,14 @@ the redirect would leave target commits outside the rollback stream.
 | Sequences are not replicated | Keep both sides quiet during sequence sync and test the first insert on each new writer. |
 | Slot loss or retained-WAL exhaustion | Monitor slot state, `wal_status`, `safe_wal_size`, disk use, and inactive reverse slots; stop on a lost or unreserved slot. |
 | PostgreSQL 18 -> 17 incompatibility | Use text-mode reverse replication and avoid PostgreSQL 18-only table features, particularly generated-column behavior. |
-| pgAdmin execution error | Execute only the selected, database-labelled block from the checked-in SQL and verify database, publication, subscription, slot, and system identifier afterward. |
+| Wrong endpoint or database | Use the checked-in `psql` helpers with `ON_ERROR_STOP`, then verify database, publication, subscription, slot, and system identifier. |
 | Credential or endpoint exposure | Use TLS verification, provider trusted-source/firewall allowlists, mode-0600 `.pgpass`/state files, and environment variables. Never put secrets in YAML or SQL. |
 
 ## Defaults and boundaries
 
 - Two databases in one cluster pair; multi-pair orchestration is deferred.
 - 10,000 accounts, four clients, and about 20 transactions/second per
-  database by default; all are adjustable in `config.env`.
+  database by default; all are adjustable in `local/config.env`.
 - The cooperative path uses `appctl stop`; database-enforced `NOLOGIN` is a
   required failure drill and fallback.
 - Finalization is rehearsed only in a fresh successful-cutover run, after the

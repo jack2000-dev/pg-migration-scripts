@@ -40,6 +40,7 @@ FORWARD_REPLICATING
   -> CUTOVER_COMPLETE
 
 CUTOVER_COMPLETE
+  -> ROLLBACK_WRITES_FROZEN
   -> ROLLBACK_LSN_CAPTURED
   -> ROLLBACK_CAUGHT_UP
   -> ROLLBACK_SEQUENCES_SYNCED
@@ -419,8 +420,8 @@ JSON output:
 Exit codes:
 
 ~~~text
-1    unexpected internal failure; inspect the private controller log
 0    healthy or requested step completed
+1    unexpected internal failure; inspect the private controller log
 2    blocked or unhealthy
 3    invalid configuration or input
 4    PostgreSQL or connection failure

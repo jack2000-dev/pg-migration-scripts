@@ -11,8 +11,8 @@ from typing import Any, Callable
 
 from .config import Config, Database
 from .output import bytes_text, emit, table
-from .pg import Psql, PostgreSQLError, qualified, quote_ident, quote_literal
-from .state import FORWARD_PHASES, StateError, StateStore, now
+from .pg import Psql, qualified, quote_ident, quote_literal
+from .state import StateStore, now
 
 
 class ControllerError(RuntimeError):
@@ -197,6 +197,8 @@ class Controller:
                 problems.append("subscription publication differs")
             if subscription.get("subslotname") != slot_name:
                 problems.append("subscription slot differs")
+            if subscription.get("subbinary"):
+                problems.append("subscription binary mode is enabled")
         if not slot:
             problems.append("slot missing")
         else:
@@ -269,10 +271,14 @@ class Controller:
                 problems.append("reverse subscription two-phase mode differs")
             if not subscription.get("subdisableonerr"):
                 problems.append("reverse subscription disable_on_error is off")
-            if require_active and not subscription.get("subenabled"):
-                problems.append("reverse subscription disabled")
-            if not require_active and subscription.get("subenabled"):
-                problems.append("reverse subscription enabled during preparation")
+            if subscription.get("subrunasowner"):
+                problems.append("reverse subscription run_as_owner is enabled")
+            if subscription.get("subfailover"):
+                problems.append("reverse subscription failover mode is enabled")
+            if bool(subscription.get("subenabled")) != require_active:
+                problems.append("reverse subscription enabled state differs")
+        if not subscriber.get("origin"):
+            problems.append("reverse replication origin missing")
         if self._table_set(subscriber.get("relations", [])) != self._manifest(db):
             problems.append("reverse subscription table manifest differs")
         if int(subscriber.get("not_ready_count", 0)):
@@ -286,10 +292,10 @@ class Controller:
                 problems.append("reverse slot database differs")
             if slot.get("wal_status") not in {"reserved", "extended"}:
                 problems.append(f"reverse slot WAL status {slot.get('wal_status')}")
-            if require_active and not slot.get("active"):
-                problems.append("reverse slot inactive")
-        if require_active and not self._main_worker(subscriber):
-            problems.append("reverse apply worker missing")
+            if bool(slot.get("active")) != require_active:
+                problems.append("reverse slot active state differs")
+        if bool(self._main_worker(subscriber)) != require_active:
+            problems.append("reverse apply worker state differs")
         return problems, publisher, subscriber
 
     def _capacity(self) -> dict[str, Any]:
@@ -339,6 +345,7 @@ class Controller:
             identities["source"][db.name] = self.source.validate_identity(db.name)
             identities["target"][db.name] = self.target.validate_identity(db.name)
             first[db.name] = self._inspect_forward(db)
+
         if observe_seconds:
             time.sleep(observe_seconds)
         rows = []
@@ -428,7 +435,7 @@ class Controller:
             phase = self.state.database(db.name)["phase"]
             if phase == "FINALIZED":
                 rows.append([db.name, phase, "-", "-", "-", "-", "FINALIZED"])
-                details.append({"database": db.name, "phase": phase, "healthy": True})
+                details.append({"database": db.name, "phase": phase, "healthy": True, "problems": []})
                 continue
             use_reverse = phase in {
                 "REVERSE_PREPARED", "REVERSE_ACTIVE", "CUTOVER_COMPLETE",
@@ -439,45 +446,53 @@ class Controller:
                 "REVERSE_ACTIVE", "CUTOVER_COMPLETE", "ROLLBACK_WRITES_FROZEN",
                 "ROLLBACK_LSN_CAPTURED", "ROLLBACK_CAUGHT_UP", "ROLLBACK_SEQUENCES_SYNCED",
             }
-            info = self._target_info(db, reverse=use_reverse)
-            subscription = info.get("subscription") or {}
-            worker = self._main_worker(info)
-            slot_runner = self.target if use_reverse else self.source
-            slot_name = db.reverse_slot if use_reverse else self._forward_slot(db)
-            pub_name = db.reverse_publication if use_reverse else db.forward_publication
-            publisher_info = slot_runner.file(
-                db.name, "precheck_source.sql", {"publication": pub_name, "slot": slot_name}
-            )
-            slot_info = publisher_info.get("slot") or {}
-            stats = info.get("stats") or {}
-            lag = slot_info.get("lag_bytes")
-            enabled_expected = reverse_active or phase in {"FORWARD_REPLICATING", "WRITES_FROZEN", "FINAL_LSN_CAPTURED", "FORWARD_CAUGHT_UP"}
-            ok = bool(subscription) and bool(subscription.get("subenabled")) == enabled_expected
-            if enabled_expected:
-                ok = ok and worker is not None and bool(slot_info.get("active"))
-            ok = ok and slot_info.get("wal_status") in {"reserved", "extended"}
-            if not publisher_info.get("publication"):
-                ok = False
-            elif publication_actions(publisher_info["publication"]) != set(db.expected_publish):
-                ok = False
-            if self._table_set(publisher_info.get("tables", [])) != self._manifest(db):
-                ok = False
-            if enabled_expected and lag is not None and lag > self.config.healthy_lag_bytes:
-                ok = False
-            schema_drift = self._schema_drift(db) if use_reverse else False
-            if schema_drift:
-                ok = False
+            if use_reverse:
+                problems, publisher, subscriber = self._reverse_status(
+                    db, require_active=reverse_active
+                )
+                slot = publisher.get("slot") or {}
+            elif phase in {"FORWARD_DISABLED", "SEQUENCES_SYNCED"}:
+                problems = self._forward_disabled_problems(db)
+                subscriber = self._target_info(db)
+                publisher = self._source_info(db, self._forward_slot(db, subscriber))
+                slot = publisher.get("slot") or {}
+            else:
+                inspected = self._inspect_forward(db)
+                problems = list(inspected["problems"])
+                subscriber = inspected["target"]
+                publisher = inspected["source"]
+                slot = inspected["slot"] or {}
+            if use_reverse and self._schema_drift(db):
+                problems.append("schema drift detected")
+            lag = slot.get("lag_bytes")
+            if reverse_active and lag is not None and lag > self.config.healthy_lag_bytes:
+                problems.append(f"lag exceeds {self.config.healthy_lag_bytes} bytes")
+            stats = subscriber.get("stats") or {}
+            ok = not problems
             healthy &= ok
             rows.append([
-                db.name, phase, str(bool(slot_info.get("active"))).lower(), bytes_text(lag),
+                db.name, phase, str(bool(slot.get("active"))).lower(), bytes_text(lag),
                 stats.get("apply_error_count", 0), stats.get("sync_error_count", 0),
                 "HEALTHY" if ok else "UNHEALTHY",
             ])
-            details.append({"database": db.name, "phase": phase, "slot": slot_info, "subscription": info, "schema_drift": schema_drift, "healthy": ok})
+            details.append({
+                "database": db.name,
+                "phase": phase,
+                "slot": slot,
+                "subscription": subscriber,
+                "problems": problems,
+                "healthy": ok,
+            })
         if as_json:
             emit({"healthy": healthy, "writer": self.state.data["writer"], "databases": details}, True)
         else:
-            table(["DATABASE", "PHASE", "SLOT_ACTIVE", "LAG", "APPLY_ERRORS", "SYNC_ERRORS", "STATUS"], rows)
+            table(
+                ["DATABASE", "PHASE", "SLOT_ACTIVE", "LAG", "APPLY_ERRORS", "SYNC_ERRORS", "STATUS"],
+                rows,
+            )
+            for item in details:
+                if item["problems"]:
+                    print(f"{item['database']}: " + "; ".join(item["problems"]))
         if not healthy:
             raise ControllerError("one or more databases are unhealthy")
 
@@ -524,7 +539,9 @@ class Controller:
     def capture_lsn(self, confirmed: bool, force: bool, resume: bool) -> None:
         if not confirmed:
             raise ControllerError("capture-lsn requires --confirm-source-writes-frozen")
-        self._require_phases("capture-lsn", {"FORWARD_REPLICATING", "WRITES_FROZEN", "FINAL_LSN_CAPTURED"})
+        self._require_phases(
+            "capture-lsn", {"FORWARD_REPLICATING", "WRITES_FROZEN", "FINAL_LSN_CAPTURED"}
+        )
         if not self.state.data.get("last_precheck", {}).get("healthy"):
             raise ControllerError("a successful precheck is required before final LSN capture")
         if self.state.data["writer"] not in {"source", "none"}:
@@ -553,67 +570,75 @@ class Controller:
         self._batch("capture-lsn", resume, False, capture)
 
     def _progress(self, db: Database, reverse: bool, final_lsn: str) -> tuple[bool, int | None, str | None]:
-        if reverse:
-            problems, publisher, subscriber = self._reverse_status(db, require_active=True)
-            publication = db.reverse_publication
-            slot_name = db.reverse_slot
-        else:
-            subscriber = self._target_info(db)
-            publication = db.forward_publication
-            slot_name = self._forward_slot(db)
-            publisher = self.source.file(
-                db.name, "precheck_source.sql", {"publication": publication, "slot": slot_name}
-            )
-            subscription = subscriber.get("subscription") or {}
-            if not subscription.get("subenabled"):
-                problems = ["forward subscription disabled"]
-            else:
-                problems = []
-            slot = publisher.get("slot") or {}
-            if set(subscription.get("subpublications", [])) != {publication}:
-                problems.append("forward subscription publication differs")
-            if subscription.get("subslotname") != slot_name:
-                problems.append("forward subscription slot differs")
-            if publication_actions(publisher.get("publication")) != set(db.expected_publish):
-                problems.append("forward publication actions differ")
-            if self._table_set(publisher.get("tables", [])) != self._manifest(db):
-                problems.append("forward publication table manifest differs")
-            if slot.get("slot_type") != "logical" or slot.get("plugin") != "pgoutput":
-                problems.append("forward slot is not logical pgoutput")
-            if slot.get("database") != db.name or not slot.get("active"):
-                problems.append("forward slot is inactive or belongs to another database")
-            if int(subscriber.get("not_ready_count", 0)):
-                problems.append("forward subscription tables not ready")
-        worker = self._main_worker(subscriber)
-        if worker is None:
-            problems.append("apply worker missing")
-        if problems:
-            raise ControllerError(f"{db.name}: replication topology invalid: " + "; ".join(problems))
-        latest = worker.get("latest_end_lsn") if worker else None
-        slot = publisher.get("slot") or {}
-        confirmed = slot.get("confirmed_flush_lsn")
         final_value = lsn_int(final_lsn)
         if final_value is None:
-            raise ControllerError(f"{db.name}: final LSN checkpoint is missing")
+            raise ControllerError(f"{db.name}: final LSN is missing")
+        if reverse:
+            problems, publisher, subscriber = self._reverse_status(db, require_active=True)
+        else:
+            subscriber = self._target_info(db)
+            slot_name = self._forward_slot(db, subscriber)
+            publisher = self._source_info(db, slot_name)
+            subscription = subscriber.get("subscription")
+            publication = publisher.get("publication")
+            slot = publisher.get("slot")
+            worker = self._main_worker(subscriber)
+            problems = []
+            if not subscription:
+                problems.append("forward subscription missing")
+            else:
+                if not subscription.get("subenabled"):
+                    problems.append("forward subscription disabled")
+                if set(subscription.get("subpublications", [])) != {db.forward_publication}:
+                    problems.append("forward subscription publication differs")
+                if subscription.get("subslotname") != slot_name:
+                    problems.append("forward subscription slot differs")
+                if subscription.get("subbinary"):
+                    problems.append("forward subscription binary mode is enabled")
+            if not publication:
+                problems.append("forward publication missing")
+            else:
+                if publication_actions(publication) != set(db.expected_publish):
+                    problems.append("forward publication actions differ")
+                if self._table_set(publisher.get("tables", [])) != self._manifest(db):
+                    problems.append("forward publication table manifest differs")
+            if self._table_set(subscriber.get("relations", [])) != self._manifest(db):
+                problems.append("forward subscription table manifest differs")
+            if int(subscriber.get("not_ready_count", 0)):
+                problems.append("forward subscription tables not ready")
+            if not subscriber.get("origin"):
+                problems.append("forward replication origin missing")
+            if not slot:
+                problems.append("forward slot missing")
+            else:
+                if slot.get("slot_type") != "logical" or slot.get("plugin") != "pgoutput":
+                    problems.append("forward slot is not logical pgoutput")
+                if slot.get("database") != db.name:
+                    problems.append("forward slot database differs")
+                if not slot.get("active"):
+                    problems.append("forward slot inactive")
+                if slot.get("wal_status") not in {"reserved", "extended"}:
+                    problems.append(f"forward slot WAL status {slot.get('wal_status')}")
+            if not worker:
+                problems.append("forward apply worker missing")
+        if problems:
+            raise ControllerError(f"{db.name}: replication topology is unsafe: " + "; ".join(problems))
+        worker = self._main_worker(subscriber)
+        latest = worker.get("latest_end_lsn") if worker else None
+        confirmed = (publisher.get("slot") or {}).get("confirmed_flush_lsn")
         latest_value = lsn_int(latest)
         confirmed_value = lsn_int(confirmed)
-        values = [value for value in (latest_value, confirmed_value) if value is not None]
-        observed = min(values) if values else None
+        observed = min(v for v in (latest_value, confirmed_value) if v is not None) if any(v is not None for v in (latest_value, confirmed_value)) else None
         remaining = None if observed is None else max(final_value - observed, 0)
         ready = (
-            not problems
-            and worker is not None
-            and bool((subscriber.get("subscription") or {}).get("subenabled"))
-            and int(subscriber.get("not_ready_count", 0)) == 0
-            and latest_value is not None and confirmed_value is not None
+            latest_value is not None and confirmed_value is not None
             and latest_value >= final_value and confirmed_value >= final_value
-            and slot.get("wal_status") in {"reserved", "extended"}
         )
         return ready, remaining, latest
 
     def wait_catchup(self, interval: float, timeout: float | None) -> None:
         if interval <= 0 or (timeout is not None and timeout < 0):
-            raise ControllerError("catchup interval must be positive and timeout cannot be negative")
+            raise ControllerError("poll interval must be positive and timeout cannot be negative")
         self._require_phases("wait-catchup", {"FINAL_LSN_CAPTURED", "FORWARD_CAUGHT_UP"})
         self._validate_batch_identities()
         started = time.monotonic()
@@ -639,37 +664,117 @@ class Controller:
         self._require_phases("disable-forward", {"FORWARD_CAUGHT_UP", "FORWARD_DISABLED"})
         self._validate_batch_identities()
         for db in self.config.databases:
+            phase = self.state.database(db.name)["phase"]
             info = self._target_info(db)
-            if not info.get("subscription") and not ignore_missing:
-                raise ControllerError(f"{db.name}: forward subscription is missing")
+            if not info.get("subscription"):
+                if not ignore_missing:
+                    raise ControllerError(f"{db.name}: forward subscription is missing")
+                checkpoint = self.state.database(db.name)["checkpoints"].get("forward_slot", {})
+                slot_name = db.forward_slot or checkpoint.get("name")
+                if not slot_name:
+                    raise ControllerError(
+                        f"{db.name}: cannot safely ignore a missing subscription without a recorded forward slot"
+                    )
+                source = self._source_info(db, slot_name)
+                slot = source.get("slot")
+                if not slot:
+                    raise ControllerError(f"{db.name}: recorded forward slot is missing")
+                if slot.get("active"):
+                    raise ControllerError(f"{db.name}: cannot ignore a missing subscription while its slot is active")
+            elif phase == "FORWARD_CAUGHT_UP":
+                final = self.state.database(db.name)["checkpoints"]["FINAL_LSN_CAPTURED"]["final_source_lsn"]
+                ready, _, _ = self._progress(db, False, final)
+                if not ready:
+                    raise ControllerError(f"{db.name}: forward replication has not reached the final LSN")
+            else:
+                problems = self._forward_disabled_problems(db)
+                if problems:
+                    raise ControllerError(
+                        f"{db.name}: forward replication is not safely disabled: " + "; ".join(problems)
+                    )
 
         def disable(db: Database) -> None:
             self._identity_line("target", db.name, self.target)
             info = self._target_info(db)
             if not info.get("subscription"):
-                if ignore_missing:
-                    checkpoint = self.state.database(db.name)["checkpoints"].get("forward_slot", {})
-                    slot_name = db.forward_slot or checkpoint.get("name")
-                    if not slot_name:
-                        raise ControllerError("cannot safely ignore a missing subscription without a recorded forward slot")
-                    slot = self._source_info(db, slot_name).get("slot") or {}
-                    if slot.get("active"):
-                        raise ControllerError("cannot ignore missing subscription while its forward slot is active")
-                    self.state.set_phase(db.name, "FORWARD_DISABLED", ignored_missing=True)
-                    return
-                raise ControllerError("subscription missing")
+                if not ignore_missing:
+                    raise ControllerError("subscription missing")
+                checkpoint = self.state.database(db.name)["checkpoints"].get("forward_slot", {})
+                slot_name = db.forward_slot or checkpoint.get("name")
+                source = self._source_info(db, slot_name) if slot_name else {}
+                slot = source.get("slot")
+                if not slot or slot.get("active"):
+                    raise ControllerError("recorded forward slot is missing or active")
+                self.state.set_phase(db.name, "FORWARD_DISABLED", ignored_missing=True)
+                problems = self._forward_disabled_problems(db)
+                if problems:
+                    raise ControllerError("forward disabled-state validation failed: " + "; ".join(problems))
+                return
             if info["subscription"].get("subenabled"):
-                self.target.run(db.name, f"ALTER SUBSCRIPTION {quote_ident(db.forward_subscription)} DISABLE;", read_only=False)
+                self.target.run(
+                    db.name,
+                    f"ALTER SUBSCRIPTION {quote_ident(db.forward_subscription)} DISABLE;",
+                    read_only=False,
+                )
             verified = self._target_info(db)
+            if not verified.get("subscription"):
+                raise ControllerError("subscription disappeared while it was being disabled")
             if verified["subscription"].get("subenabled") or self._main_worker(verified):
                 raise ControllerError("subscription did not become disabled")
-            slot = self._source_info(db, self._forward_slot(db)).get("slot") or {}
-            if slot.get("active"):
-                raise ControllerError("forward slot is still active; wait briefly and resume")
-            if self.state.database(db.name)["phase"] in {"FORWARD_CAUGHT_UP", "FORWARD_DISABLED"}:
-                self.state.set_phase(db.name, "FORWARD_DISABLED")
+            problems = self._forward_disabled_problems(db)
+            if problems:
+                raise ControllerError("forward disabled-state validation failed: " + "; ".join(problems))
+            self.state.set_phase(db.name, "FORWARD_DISABLED")
 
         self._batch("disable-forward", resume, dry_run, disable)
+
+    def _forward_disabled_problems(self, db: Database) -> list[str]:
+        subscriber = self._target_info(db)
+        subscription = subscriber.get("subscription")
+        checkpoint = self.state.database(db.name)["checkpoints"].get("forward_slot", {})
+        slot_name = db.forward_slot or checkpoint.get("name")
+        if not slot_name and subscription:
+            slot_name = subscription.get("subslotname")
+        publisher = self._source_info(db, slot_name) if slot_name else {}
+        publication = publisher.get("publication")
+        slot = publisher.get("slot")
+        ignored_missing = bool(
+            self.state.database(db.name)["checkpoints"].get("FORWARD_DISABLED", {}).get("ignored_missing")
+        )
+        problems: list[str] = []
+        if not subscription:
+            if not ignored_missing:
+                problems.append("forward subscription missing")
+        else:
+            if subscription.get("subenabled"):
+                problems.append("forward subscription enabled")
+            if self._main_worker(subscriber):
+                problems.append("forward apply worker still present")
+            if set(subscription.get("subpublications", [])) != {db.forward_publication}:
+                problems.append("forward subscription publication differs")
+            if subscription.get("subslotname") != slot_name:
+                problems.append("forward subscription slot differs")
+            if self._table_set(subscriber.get("relations", [])) != self._manifest(db):
+                problems.append("forward subscription table manifest differs")
+        if not publication:
+            problems.append("forward publication missing")
+        else:
+            if publication_actions(publication) != set(db.expected_publish):
+                problems.append("forward publication actions differ")
+            if self._table_set(publisher.get("tables", [])) != self._manifest(db):
+                problems.append("forward publication table manifest differs")
+        if not slot:
+            problems.append("forward slot missing")
+        else:
+            if slot.get("slot_type") != "logical" or slot.get("plugin") != "pgoutput":
+                problems.append("forward slot is not logical pgoutput")
+            if slot.get("database") != db.name:
+                problems.append("forward slot database differs")
+            if slot.get("active"):
+                problems.append("forward slot is still active")
+            if slot.get("wal_status") not in {"reserved", "extended"}:
+                problems.append(f"forward slot WAL status {slot.get('wal_status')}")
+        return problems
 
     def _sequence_rows(self, runner: Psql, db: Database) -> list[dict[str, Any]]:
         rows = runner.file(db.name, "sequence_inventory.sql")
@@ -731,6 +836,10 @@ class Controller:
         ]
         if invalid:
             raise ControllerError(f"sync-sequences is no longer valid for phase in: {', '.join(invalid)}")
+        for db in self.config.databases:
+            problems = self._forward_disabled_problems(db)
+            if problems:
+                raise ControllerError(f"{db.name}: forward replication is not safely disabled: " + "; ".join(problems))
 
         def sync(db: Database) -> None:
             self._identity_line("source", db.name, self.source)
@@ -785,6 +894,10 @@ class Controller:
             for column in published:
                 if column not in pub_columns or column not in sub_columns:
                     raise ControllerError(f"{db.name}: published column {name}.{column} is missing")
+                if sub_columns[column]["generated"]:
+                    raise ControllerError(
+                        f"{db.name}: published column {name}.{column} targets a generated subscriber column"
+                    )
                 if not _type_lossless(pub_columns[column], sub_columns[column]):
                     raise ControllerError(f"{db.name}: reverse type conversion is not demonstrably lossless for {name}.{column}")
             for column, metadata in sub_columns.items():
@@ -845,6 +958,10 @@ class Controller:
         ]
         if invalid:
             raise ControllerError(f"prepare-reverse is no longer valid for phase in: {', '.join(invalid)}")
+        for db in self.config.databases:
+            problems = self._forward_disabled_problems(db)
+            if problems:
+                raise ControllerError(f"{db.name}: forward replication is not safely disabled: " + "; ".join(problems))
         capacity = self._capacity()
         if capacity["issues"]:
             raise ControllerError("; ".join(capacity["issues"]))
@@ -1154,11 +1271,27 @@ class Controller:
         print("Rollback precheck complete: reverse replication is caught up and OLD sequences are synchronized.")
 
     def rollback(self, dry_run: bool, resume: bool) -> None:
-        for db in self.config.databases:
-            if self.state.database(db.name)["phase"] not in {"ROLLBACK_SEQUENCES_SYNCED", "ROLLED_BACK"}:
-                raise StateError(f"{db.name}: rollback-precheck has not completed")
+        self._require_phases("rollback", {"ROLLBACK_SEQUENCES_SYNCED", "ROLLED_BACK"})
+        if self.state.data["writer"] != "none":
+            raise ControllerError("rollback requires TARGET writes to remain frozen")
         self._validate_batch_identities()
+        self._assert_quiescent(self.source, "SOURCE")
         self._assert_quiescent(self.target, "TARGET")
+        for db in self.config.databases:
+            phase = self.state.database(db.name)["phase"]
+            if phase == "ROLLBACK_SEQUENCES_SYNCED":
+                if self._schema_drift(db):
+                    raise ControllerError(f"{db.name}: schema drift detected before rollback")
+                final = self.state.database(db.name)["checkpoints"]["ROLLBACK_LSN_CAPTURED"]["final_target_lsn"]
+                ready, _, _ = self._progress(db, True, final)
+                if not ready:
+                    raise ControllerError(f"{db.name}: reverse replication has not reached the final TARGET LSN")
+            else:
+                problems, _, _ = self._reverse_status(db, require_active=False)
+                if problems:
+                    raise ControllerError(
+                        f"{db.name}: rolled-back topology is unsafe: " + "; ".join(problems)
+                    )
 
         def disable(db: Database) -> None:
             self._identity_line("source", db.name, self.source)
@@ -1166,14 +1299,24 @@ class Controller:
             if not info.get("subscription"):
                 raise ControllerError("reverse subscription missing")
             if info["subscription"].get("subenabled"):
-                self.source.run(db.name, f"ALTER SUBSCRIPTION {quote_ident(db.reverse_subscription)} DISABLE;", read_only=False)
-            if self._target_info(db, reverse=True)["subscription"].get("subenabled"):
-                raise ControllerError("reverse subscription is still enabled")
+                self.source.run(
+                    db.name,
+                    f"ALTER SUBSCRIPTION {quote_ident(db.reverse_subscription)} DISABLE;",
+                    read_only=False,
+                )
+            verified = self._target_info(db, reverse=True)
+            if not verified.get("subscription"):
+                raise ControllerError("reverse subscription disappeared while it was being disabled")
+            if verified["subscription"].get("subenabled") or self._main_worker(verified):
+                raise ControllerError("reverse subscription is still enabled or its worker is present")
             slot = self.target.file(db.name, "precheck_source.sql", {
                 "publication": db.reverse_publication, "slot": db.reverse_slot,
             }).get("slot") or {}
             if slot.get("active"):
                 raise ControllerError("reverse slot is still active; wait briefly and resume")
+            problems, _, _ = self._reverse_status(db, require_active=False)
+            if problems:
+                raise ControllerError("reverse disabled-state validation failed: " + "; ".join(problems))
             self.state.set_phase(db.name, "ROLLED_BACK")
 
         self._batch("rollback", resume, dry_run, disable)

@@ -22,6 +22,15 @@ def _required(mapping: dict[str, Any], key: str, context: str) -> Any:
     return value
 
 
+def _string(mapping: dict[str, Any], key: str, context: str, *, required: bool = True) -> str | None:
+    value = _required(mapping, key, context) if required else mapping.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not value or "\x00" in value:
+        qualifier = f"{context}.{key}"
+        raise ConfigError(f"{qualifier} must be a non-empty string without NUL bytes")
+    return value
+
 def _table(value: Any, context: str) -> tuple[str, str]:
     if not isinstance(value, dict):
         raise ConfigError(f"{context} must contain schema and table mappings")
@@ -62,20 +71,16 @@ class Endpoint:
             raise ConfigError(f"invalid {name} port or connect_timeout")
         endpoint = cls(
             name=name,
-            host=str(_required(raw, "host", name)),
+            host=_string(raw, "host", name),
             port=port,
-            user=str(_required(raw, "user", name)),
-            sslmode=str(raw.get("sslmode", "require")),
+            user=_string(raw, "user", name),
+            sslmode=_string(raw, "sslmode", name, required=False) or "require",
             system_identifier=str(_required(raw, "expected_system_identifier", name)),
-            password_env=raw.get("password_env"),
-            replication_user=raw.get("replication_user"),
-            replication_password_env=raw.get("replication_password_env"),
+            password_env=_string(raw, "password_env", name, required=False),
+            replication_user=_string(raw, "replication_user", name, required=False),
+            replication_password_env=_string(raw, "replication_password_env", name, required=False),
             connect_timeout=timeout,
         )
-        for attr in ("password_env", "replication_password_env"):
-            env_name = getattr(endpoint, attr)
-            if env_name is not None and (not isinstance(env_name, str) or not env_name):
-                raise ConfigError(f"{name}.{attr} must be a non-empty environment variable name")
         return endpoint
 
     def controller_environment(self) -> dict[str, str]:
@@ -122,22 +127,24 @@ class Database:
         actions_raw = raw.get("expected_publish", ["insert", "update", "delete", "truncate"])
         if not isinstance(actions_raw, list):
             raise ConfigError(f"{context}.expected_publish must be a list")
-        actions = frozenset(str(v).lower() for v in actions_raw)
+        if not all(isinstance(value, str) for value in actions_raw):
+            raise ConfigError(f"{context}.expected_publish entries must be strings")
+        actions = frozenset(value.lower() for value in actions_raw)
         valid_actions = {"insert", "update", "delete", "truncate"}
         if not actions or not actions <= valid_actions:
             raise ConfigError(f"{context}.expected_publish must use {sorted(valid_actions)}")
         test = raw.get("test_table")
-        reverse_subscription = str(_required(raw, "reverse_subscription", context))
+        reverse_subscription = _string(raw, "reverse_subscription", context)
         return cls(
-            name=str(_required(raw, "name", context)),
-            forward_publication=str(_required(raw, "forward_publication", context)),
-            forward_subscription=str(_required(raw, "forward_subscription", context)),
-            reverse_publication=str(_required(raw, "reverse_publication", context)),
+            name=_string(raw, "name", context),
+            forward_publication=_string(raw, "forward_publication", context),
+            forward_subscription=_string(raw, "forward_subscription", context),
+            reverse_publication=_string(raw, "reverse_publication", context),
             reverse_subscription=reverse_subscription,
             expected_tables=tables,
             expected_publish=actions,
-            forward_slot=raw.get("forward_slot"),
-            reverse_slot=str(raw.get("reverse_slot", reverse_subscription)),
+            forward_slot=_string(raw, "forward_slot", context, required=False),
+            reverse_slot=_string(raw, "reverse_slot", context, required=False) or reverse_subscription,
             test_table=_table(test, f"{context}.test_table") if test is not None else None,
         )
 

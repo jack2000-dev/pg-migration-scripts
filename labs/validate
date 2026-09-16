@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-CONFIG=${LAB_CONFIG:-"$ROOT/config.env"}
+CONFIG=${LAB_CONFIG:-"$ROOT/local/config.env"}
 SQL="$ROOT/sql/validate.sql"
 PSQL_BIN=${PSQL_BIN:-psql}
 
@@ -11,7 +11,7 @@ die() {
     exit 1
 }
 
-[[ -r "$CONFIG" ]] || die "missing config: $CONFIG (copy config.example.env)"
+[[ -r "$CONFIG" ]] || die "missing config: $CONFIG (copy config.example.env to local/config.env)"
 set -a
 # shellcheck disable=SC1090
 source "$CONFIG"

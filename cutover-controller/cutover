@@ -129,7 +129,9 @@ def main() -> int:
             elif command == "capture-lsn":
                 controller.capture_lsn(args.confirm_source_writes_frozen, args.force, args.resume)
             elif command == "wait-catchup":
-                controller.wait_catchup(args.interval or config.poll_interval, args.timeout)
+                controller.wait_catchup(
+                    config.poll_interval if args.interval is None else args.interval, args.timeout
+                )
             elif command == "disable-forward":
                 controller.disable_forward(args.dry_run, args.resume, args.ignore_missing)
             elif command == "sync-sequences":
@@ -145,7 +147,7 @@ def main() -> int:
             elif command == "rollback-precheck":
                 controller.rollback_precheck(
                     args.confirm_target_writes_frozen,
-                    args.interval or config.poll_interval,
+                    config.poll_interval if args.interval is None else args.interval,
                     args.timeout,
                     args.resume,
                 )

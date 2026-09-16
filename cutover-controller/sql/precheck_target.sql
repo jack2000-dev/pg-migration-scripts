@@ -24,9 +24,9 @@ WITH subscription AS (
     JOIN pg_namespace AS n ON n.oid = c.relnamespace
     ORDER BY n.nspname, c.relname
 ), origin AS (
-    SELECT ros.external_id, ros.remote_lsn::text, ros.local_lsn::text
-    FROM pg_replication_origin_status AS ros
-    JOIN subscription AS s ON ros.external_id = 'pg_' || s.oid::text
+    SELECT ro.roname AS external_id
+    FROM pg_replication_origin AS ro
+    JOIN subscription AS s ON ro.roname = 'pg_' || s.oid::text
 )
 SELECT json_build_object(
     'subscription', (SELECT row_to_json(subscription) FROM subscription),

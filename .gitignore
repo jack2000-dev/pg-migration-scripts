@@ -16,3 +16,5 @@
 # Python test and interpreter artifacts
 **/__pycache__/
 *.py[cod]
+
+/local

@@ -13,5 +13,5 @@ SELECT json_build_object(
     'wal_senders_used', (SELECT count(*) FROM pg_stat_replication),
     'logical_workers_visible', (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'logical replication worker'),
     'worker_processes_visible', (SELECT count(*) FROM pg_stat_activity WHERE backend_type <> 'client backend'),
-    'active_origins', (SELECT count(*) FROM pg_replication_origin_status)
+    'active_origins', (SELECT count(*) FROM pg_replication_origin)
 )::text;

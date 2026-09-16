@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 SELF="$ROOT/appctl"
-CONFIG=${LAB_CONFIG:-"$ROOT/config.env"}
+CONFIG=${LAB_CONFIG:-"$ROOT/local/config.env"}
 STATE_DIR=${LAB_STATE_DIR:-"$ROOT/.state"}
 WORKLOAD=${LAB_WORKLOAD:-"$ROOT/workload.sql"}
 PGBENCH_BIN=${PGBENCH_BIN:-pgbench}
@@ -15,7 +15,7 @@ die() {
 }
 
 load_config() {
-    [[ -r "$CONFIG" ]] || die "missing config: $CONFIG (copy config.example.env)"
+    [[ -r "$CONFIG" ]] || die "missing config: $CONFIG (copy config.example.env to local/config.env)"
     # config.env is trusted operator input and contains no passwords.
     set -a
     # shellcheck disable=SC1090
@@ -221,16 +221,12 @@ point() {
 }
 
 check() {
-    local side db
+    local side
     check_tools
     for side in source target; do check_side "$side"; done
     printf 'configuration OK: databases='
     printf '%s ' "${DATABASES[@]}"
     printf '\n'
-    for db in "${DATABASES[@]}"; do
-        [[ "$db" == lab_db1 || "$db" == lab_db2 ]] \
-            || printf 'warning: cutover.example.yaml does not contain %s\n' "$db" >&2
-    done
 }
 
 usage() {

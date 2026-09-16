@@ -1,0 +1,6 @@
+config.env
+cutover.yaml
+local/
+.state/
+logs/
+*.log
