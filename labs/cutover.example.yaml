@@ -1,0 +1,47 @@
+source:
+  host: source.example.com
+  port: 25060
+  user: doadmin
+  sslmode: verify-full
+  expected_system_identifier: "SOURCE_SYSTEM_IDENTIFIER"
+  # password_env: CUTOVER_SOURCE_PASSWORD
+
+target:
+  host: target.example.com
+  port: 5432
+  user: migration_admin
+  sslmode: verify-full
+  expected_system_identifier: "TARGET_SYSTEM_IDENTIFIER"
+  replication_user: lab_reverse_repl
+  replication_password_env: CUTOVER_TARGET_REPLICATION_PASSWORD
+  # password_env: CUTOVER_TARGET_PASSWORD
+
+settings:
+  poll_interval_seconds: 5
+  lock_timeout_seconds: 5
+  healthy_lag_bytes: 0
+
+databases:
+  - name: lab_db1
+    forward_publication: lab_forward_pub_db1
+    forward_subscription: lab_forward_sub_db1
+    forward_slot: lab_forward_slot_db1
+    reverse_publication: lab_reverse_pub_db1
+    reverse_subscription: lab_reverse_sub_db1
+    reverse_slot: lab_reverse_slot_db1
+    expected_tables: &lab_tables
+      - {schema: public, table: accounts}
+      - {schema: public, table: transfers}
+      - {schema: public, table: event_log}
+      - {schema: cutover_control, table: replication_probe}
+    test_table: {schema: cutover_control, table: replication_probe}
+
+  - name: lab_db2
+    forward_publication: lab_forward_pub_db2
+    forward_subscription: lab_forward_sub_db2
+    forward_slot: lab_forward_slot_db2
+    reverse_publication: lab_reverse_pub_db2
+    reverse_subscription: lab_reverse_sub_db2
+    reverse_slot: lab_reverse_slot_db2
+    expected_tables: *lab_tables
+    test_table: {schema: cutover_control, table: replication_probe}

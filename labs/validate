@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CONFIG=${LAB_CONFIG:-"$ROOT/config.env"}
+SQL="$ROOT/sql/validate.sql"
+PSQL_BIN=${PSQL_BIN:-psql}
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+[[ -r "$CONFIG" ]] || die "missing config: $CONFIG (copy config.example.env)"
+set -a
+# shellcheck disable=SC1090
+source "$CONFIG"
+set +a
+
+: "${LAB_DATABASES:?LAB_DATABASES is required}"
+: "${SOURCE_VALIDATION_USER:?SOURCE_VALIDATION_USER is required}"
+: "${TARGET_VALIDATION_USER:?TARGET_VALIDATION_USER is required}"
+command -v "$PSQL_BIN" >/dev/null || die "psql not found: $PSQL_BIN"
+IFS=',' read -r -a DATABASES <<< "$LAB_DATABASES"
+
+side_value() {
+    local side=$1 suffix=$2 name
+    name="${side^^}_${suffix}"
+    printf '%s' "${!name:-}"
+}
+
+report() {
+    local side=$1 database=$2 user
+    user=$(side_value "$side" VALIDATION_USER)
+    PGHOST=$(side_value "$side" HOST) \
+    PGPORT=$(side_value "$side" PORT) \
+    PGUSER=$user \
+    PGDATABASE=$database \
+    PGSSLMODE=$(side_value "$side" SSLMODE) \
+    PGSSLROOTCERT=$(side_value "$side" SSLROOTCERT) \
+    PGAPPNAME=lab-validator \
+    "$PSQL_BIN" -X --no-psqlrc --quiet --no-align --tuples-only \
+        --set ON_ERROR_STOP=1 --file "$SQL"
+}
+
+failed=0
+for database in "${DATABASES[@]}"; do
+    [[ "$database" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] \
+        || die "unsafe database name: $database"
+    source_report=$(report source "$database")
+    target_report=$(report target "$database")
+    printf '%s SOURCE %s\n' "$database" "$source_report"
+    printf '%s TARGET %s\n' "$database" "$target_report"
+    if [[ "$source_report" != "$target_report" ]]; then
+        printf '%s MISMATCH\n' "$database" >&2
+        failed=1
+    elif [[ "$source_report" != *'"valid": true'* ]]; then
+        printf '%s INVALID INVARIANTS\n' "$database" >&2
+        failed=1
+    else
+        printf '%s MATCH\n' "$database"
+    fi
+done
+exit "$failed"

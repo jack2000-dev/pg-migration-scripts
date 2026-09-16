@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SELF="$ROOT/appctl"
+CONFIG=${LAB_CONFIG:-"$ROOT/config.env"}
+STATE_DIR=${LAB_STATE_DIR:-"$ROOT/.state"}
+WORKLOAD=${LAB_WORKLOAD:-"$ROOT/workload.sql"}
+PGBENCH_BIN=${PGBENCH_BIN:-pgbench}
+PSQL_BIN=${PSQL_BIN:-psql}
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+load_config() {
+    [[ -r "$CONFIG" ]] || die "missing config: $CONFIG (copy config.example.env)"
+    # config.env is trusted operator input and contains no passwords.
+    set -a
+    # shellcheck disable=SC1090
+    source "$CONFIG"
+    set +a
+
+    : "${LAB_DATABASES:?LAB_DATABASES is required}"
+    : "${LAB_APP_USER:?LAB_APP_USER is required}"
+    : "${LAB_ACCOUNT_COUNT:?LAB_ACCOUNT_COUNT is required}"
+    : "${LAB_CLIENTS:?LAB_CLIENTS is required}"
+    : "${LAB_TPS:?LAB_TPS is required}"
+    LAB_THREADS=${LAB_THREADS:-2}
+    LAB_BATCH_SECONDS=${LAB_BATCH_SECONDS:-3600}
+    LAB_RETRY_SECONDS=${LAB_RETRY_SECONDS:-2}
+
+    IFS=',' read -r -a DATABASES <<< "$LAB_DATABASES"
+    ((${#DATABASES[@]} > 0)) || die "LAB_DATABASES is empty"
+    local db
+    for db in "${DATABASES[@]}"; do
+        [[ "$db" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || die "unsafe database name: $db"
+    done
+    for value in "$LAB_ACCOUNT_COUNT" "$LAB_CLIENTS" "$LAB_THREADS" \
+                 "$LAB_TPS" "$LAB_BATCH_SECONDS" "$LAB_RETRY_SECONDS"; do
+        [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "workload settings must be positive integers"
+    done
+    ((LAB_ACCOUNT_COUNT > 1)) || die "LAB_ACCOUNT_COUNT must be greater than one"
+    [[ -r "$WORKLOAD" ]] || die "missing workload: $WORKLOAD"
+}
+
+route() {
+    if [[ -r "$STATE_DIR/route" ]]; then
+        local current
+        read -r current < "$STATE_DIR/route"
+        printf '%s\n' "$current"
+    else
+        printf 'source\n'
+    fi
+}
+
+pid_file() {
+    printf '%s/%s.pid\n' "$STATE_DIR" "$1"
+}
+
+worker_running() {
+    local file pid command
+    file=$(pid_file "$1")
+    [[ -r "$file" ]] || return 1
+    read -r pid < "$file"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    command=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+    [[ "$command" == *"$SELF _worker "* ]]
+}
+
+any_running() {
+    local db
+    for db in "${DATABASES[@]}"; do
+        worker_running "$db" && return 0
+    done
+    return 1
+}
+
+side_value() {
+    local side=$1 suffix=$2 name
+    name="${side^^}_${suffix}"
+    printf '%s' "${!name:-}"
+}
+
+check_side() {
+    local side=$1 host port sslmode rootcert
+    [[ "$side" == source || "$side" == target ]] || die "route must be source or target"
+    host=$(side_value "$side" HOST)
+    port=$(side_value "$side" PORT)
+    sslmode=$(side_value "$side" SSLMODE)
+    rootcert=$(side_value "$side" SSLROOTCERT)
+    [[ -n "$host" ]] || die "${side^^}_HOST is required"
+    [[ "$port" =~ ^[0-9]+$ ]] || die "${side^^}_PORT must be numeric"
+    [[ -n "$sslmode" ]] || die "${side^^}_SSLMODE is required"
+    if [[ "$sslmode" == verify-ca || "$sslmode" == verify-full ]]; then
+        [[ -r "$rootcert" ]] || die "cannot read ${side^^}_SSLROOTCERT: $rootcert"
+    fi
+}
+
+check_tools() {
+    command -v "$PGBENCH_BIN" >/dev/null || die "pgbench not found: $PGBENCH_BIN"
+    command -v "$PSQL_BIN" >/dev/null || die "psql not found: $PSQL_BIN"
+    "$PGBENCH_BIN" --version >/dev/null 2>&1 \
+        || die "pgbench is not usable: $PGBENCH_BIN"
+    "$PSQL_BIN" --version >/dev/null 2>&1 || die "psql is not usable: $PSQL_BIN"
+}
+
+run_with_connection() {
+    local side=$1 database=$2
+    shift 2
+    PGHOST=$(side_value "$side" HOST) \
+    PGPORT=$(side_value "$side" PORT) \
+    PGUSER=$LAB_APP_USER \
+    PGDATABASE=$database \
+    PGSSLMODE=$(side_value "$side" SSLMODE) \
+    PGSSLROOTCERT=$(side_value "$side" SSLROOTCERT) \
+    PGAPPNAME=lab-generator \
+    "$@"
+}
+
+worker() {
+    local side=$1 database=$2 child=''
+    trap '[[ -z "$child" ]] || kill "$child" 2>/dev/null || true; exit 0' TERM INT
+    printf '%s worker=%s database=%s starting\n' "$(date -u +%FT%TZ)" "$side" "$database"
+    while true; do
+        run_with_connection "$side" "$database" "$PGBENCH_BIN" \
+            --no-vacuum --client="$LAB_CLIENTS" --jobs="$LAB_THREADS" \
+            --rate="$LAB_TPS" --time="$LAB_BATCH_SECONDS" \
+            --define="account_count=$LAB_ACCOUNT_COUNT" --file="$WORKLOAD" &
+        child=$!
+        wait "$child" || true
+        child=''
+        printf '%s worker=%s database=%s retrying\n' "$(date -u +%FT%TZ)" "$side" "$database"
+        sleep "$LAB_RETRY_SECONDS" &
+        child=$!
+        wait "$child" || true
+        child=''
+    done
+}
+
+start() {
+    local side db log pid
+    any_running && die "one or more workers already run; use appctl stop first"
+    side=$(route)
+    check_side "$side"
+    check_tools
+    mkdir -p "$STATE_DIR/logs"
+    chmod 700 "$STATE_DIR" "$STATE_DIR/logs"
+
+    for db in "${DATABASES[@]}"; do
+        run_with_connection "$side" "$db" "$PSQL_BIN" -X -v ON_ERROR_STOP=1 \
+            --no-align --tuples-only --command='SELECT 1' >/dev/null \
+            || die "cannot connect as $LAB_APP_USER to $side/$db"
+    done
+    for db in "${DATABASES[@]}"; do
+        log="$STATE_DIR/logs/${side}-${db}.log"
+        nohup "$SELF" _worker "$side" "$db" >> "$log" 2>&1 </dev/null &
+        pid=$!
+        printf '%s\n' "$pid" > "$(pid_file "$db")"
+        printf 'started %-12s pid=%s route=%s log=%s\n' "$db" "$pid" "$side" "$log"
+    done
+    sleep 1
+    for db in "${DATABASES[@]}"; do
+        worker_running "$db" || die "$db worker exited; inspect its log"
+    done
+}
+
+stop() {
+    local db file pid deadline failed=0
+    for db in "${DATABASES[@]}"; do
+        file=$(pid_file "$db")
+        if ! worker_running "$db"; then
+            rm -f "$file"
+            printf 'stopped %-12s already stopped\n' "$db"
+            continue
+        fi
+        read -r pid < "$file"
+        kill "$pid"
+        deadline=$((SECONDS + 10))
+        while kill -0 "$pid" 2>/dev/null && ((SECONDS < deadline)); do
+            sleep 0.1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            printf 'ERROR: %s pid=%s did not stop\n' "$db" "$pid" >&2
+            failed=1
+        else
+            rm -f "$file"
+            printf 'stopped %-12s pid=%s\n' "$db" "$pid"
+        fi
+    done
+    return "$failed"
+}
+
+status() {
+    local db file pid current
+    current=$(route)
+    printf 'route: %s\n' "$current"
+    for db in "${DATABASES[@]}"; do
+        file=$(pid_file "$db")
+        if worker_running "$db"; then
+            read -r pid < "$file"
+            printf '%-12s RUNNING pid=%s\n' "$db" "$pid"
+        else
+            printf '%-12s STOPPED\n' "$db"
+        fi
+    done
+}
+
+point() {
+    local side=${1:-}
+    check_side "$side"
+    any_running && die "stop all workers before changing route"
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    printf '%s\n' "$side" > "$STATE_DIR/route.new"
+    mv "$STATE_DIR/route.new" "$STATE_DIR/route"
+    printf 'route set to %s\n' "$side"
+}
+
+check() {
+    local side db
+    check_tools
+    for side in source target; do check_side "$side"; done
+    printf 'configuration OK: databases='
+    printf '%s ' "${DATABASES[@]}"
+    printf '\n'
+    for db in "${DATABASES[@]}"; do
+        [[ "$db" == lab_db1 || "$db" == lab_db2 ]] \
+            || printf 'warning: cutover.example.yaml does not contain %s\n' "$db" >&2
+    done
+}
+
+usage() {
+    printf 'usage: %s {check|start|stop|status|point source|point target}\n' "$0" >&2
+    exit 2
+}
+
+umask 077
+load_config
+case ${1:-} in
+    check) check ;;
+    start) start ;;
+    stop) stop ;;
+    status) status ;;
+    point) point "${2:-}" ;;
+    _worker) [[ $# == 3 ]] || usage; worker "$2" "$3" ;;
+    *) usage ;;
+esac
