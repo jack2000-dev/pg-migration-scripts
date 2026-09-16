@@ -1,0 +1,18 @@
+# Local configuration and credentials
+/cutover-controller/config.yaml
+/labs/config.env
+/labs/cutover.yaml
+
+# Controller runtime data
+/cutover-controller/.venv/
+/cutover-controller/state/*
+!/cutover-controller/state/.gitkeep
+/cutover-controller/logs/*
+!/cutover-controller/logs/.gitkeep
+
+# Lab runtime data
+/labs/.state/
+
+# Python test and interpreter artifacts
+**/__pycache__/
+*.py[cod]
