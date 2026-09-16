@@ -9,25 +9,19 @@ and its rehearsal lab.
   [`labs/PLAN.md`](labs/PLAN.md) records its topology, failure drills, and
   safety boundaries.
 
-## System context
+## Cutover flow
 
 ```mermaid
-C4Context
-    title PostgreSQL logical-replication cutover
-
-    Person(operator, "Migration operator", "Rehearses the procedure, freezes writes, and approves routing changes")
-    System(controller, "Cutover controller", "Validates topology and coordinates cutover, rollback, and cleanup")
-    System_Ext(application, "Application workload", "Uses the active database endpoint")
-    SystemDb_Ext(source, "Source PostgreSQL 17", "Original writer and forward publisher")
-    SystemDb_Ext(target, "Target PostgreSQL 18", "Forward subscriber and post-cutover writer")
-
-    Rel(operator, controller, "Runs commands and reviews gates")
-    Rel(operator, application, "Stops, starts, and redirects")
-    Rel(controller, source, "Checks and manages replication", "psql / TLS")
-    Rel(controller, target, "Checks and manages replication", "psql / TLS")
-    Rel(application, source, "Writes before cutover", "PostgreSQL / TLS")
-    Rel(application, target, "Writes after cutover", "PostgreSQL / TLS")
-    BiRel(source, target, "Logical replication; direction changes for rollback")
+flowchart LR
+    precheck[1. Precheck] --> freeze[2. Freeze source writes]
+    freeze --> catchup[3. Wait for target catch-up]
+    catchup --> stop[4. Disable forward replication and sync sequences]
+    stop --> reverse[5. Prepare and enable reverse replication]
+    reverse --> route[6. Route writes to target]
+    route --> decision{Rollback needed?}
+    decision -->|No| finalize[Finalize after rollback window]
+    decision -->|Yes| rollback[Freeze target, catch up source, and sync sequences]
+    rollback --> source[Disable reverse replication and route writes to source]
 ```
 
 Run the controller from its directory:

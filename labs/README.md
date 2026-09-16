@@ -4,28 +4,30 @@ This lab rehearses a PostgreSQL 17 to 18 logical-replication cutover and
 rollback across multiple databases:
 
 ```mermaid
-C4Container
-    title Cutover rehearsal lab
+flowchart LR
+    subgraph workstation[Operator workstation]
+        operator[Operator]
+        appctl[appctl]
+        workers[pgbench workers]
+        controller[Cutover controller]
 
-    Person(operator, "Migration operator", "Runs the rehearsal from a terminal")
-    Container_Boundary(workstation, "Operator workstation") {
-        Container(appctl, "appctl", "Bash", "Starts, stops, and redirects the simulated workload")
-        Container(pgbench, "pgbench workers", "pgbench", "Generate writes for every configured database")
-        Container(controller, "Cutover controller", "Python / uv", "Checks safety gates and coordinates replication")
-    }
-    ContainerDb_Ext(source, "DigitalOcean PostgreSQL 17", "PostgreSQL", "Source writer before cutover")
-    ContainerDb_Ext(target, "OpenStack PostgreSQL 18", "PostgreSQL", "Target writer after cutover")
+        operator --> appctl --> workers
+        operator --> controller
+    end
 
-    Rel(operator, appctl, "Controls workload")
-    Rel(operator, controller, "Runs cutover and rollback commands")
-    Rel(appctl, pgbench, "Starts, stops, and redirects")
-    Rel(pgbench, source, "Writes before cutover", "PostgreSQL / TLS")
-    Rel(pgbench, target, "Writes after cutover", "PostgreSQL / TLS")
-    Rel(controller, source, "Validates and manages", "psql / TLS")
-    Rel(controller, target, "Validates and manages", "psql / TLS")
-    Rel(source, target, "Forward logical replication")
-    Rel(target, source, "Rollback logical replication")
+    source[(DigitalOcean<br/>PostgreSQL 17)]
+    target[(OpenStack<br/>PostgreSQL 18)]
+
+    workers -->|Writes before cutover| source
+    workers -.->|Writes after redirect| target
+    controller -->|psql / TLS| source
+    controller -->|psql / TLS| target
+    source ==>|Forward replication| target
+    target -.->|Rollback replication| source
 ```
+
+Solid workload and replication arrows show the initial state. Dashed arrows
+become active after the cutover prepares the rollback path and redirects writes.
 
 All operational steps use terminal `psql`. pgAdmin is optional and should be
 used only for read-only inspection. This lab does not provision cloud
