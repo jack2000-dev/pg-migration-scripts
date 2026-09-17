@@ -1,130 +1,147 @@
 # PostgreSQL cutover tooling
 
 This repository contains a PostgreSQL logical-replication cutover controller
-and its rehearsal lab.
+and a lab for rehearsing the same workflow before production.
 
-- [`cutover-controller/`](cutover-controller/README.md) is the Python CLI for
-  a controlled cutover and rollback.
-- [`labs/`](labs/README.md) is the environment simulator and operator runbook.
-  [`labs/PLAN.md`](labs/PLAN.md) records its topology, failure drills, and
-  safety boundaries.
+Use the lab first. The controller does not provision PostgreSQL, freeze
+application writes, or route application traffic for you.
 
-## Cutover flow
+## What is here
 
-```mermaid
-flowchart LR
-    precheck[1. Precheck] --> freeze[2. Freeze source writes]
-    freeze --> catchup[3. Wait for target catch-up]
-    catchup --> stop[4. Disable forward replication and sync sequences]
-    stop --> reverse[5. Prepare and enable reverse replication]
-    reverse --> route[6. Route writes to target]
-    route --> decision{Rollback needed?}
-    decision -->|No| finalize[Finalize after rollback window]
-    decision -->|Yes| rollback[Freeze target, catch up source, and sync sequences]
-    rollback --> source[Disable reverse replication and route writes to source]
-```
+- [`cutover-controller/`](cutover-controller/README.md): Python CLI that
+  validates, checkpoints, and coordinates cutover and rollback.
+- [`labs/`](labs/README.md): simulator, SQL setup, workload generator, and
+  complete operator runbook.
+- [`labs/PLAN.md`](labs/PLAN.md): lab topology, failure drills, and safety
+  boundaries.
 
-Run the controller from its directory:
+## Prerequisites
+
+- PostgreSQL 17 source and PostgreSQL 18 target, with the same lab databases
+  created on both clusters.
+- Logical replication enabled with spare slots, WAL senders, and workers.
+- Network and TLS connectivity in both directions: source → target for
+  forward replication and target → source for rollback replication.
+- Provider/admin, validation, application, and replication roles with the
+  privileges described in [`labs/README.md`](labs/README.md).
+- Operator workstation with `bash`, `psql`, `pgbench`, `uv`, and Python 3.10+.
+- TLS CA files and credentials in a mode-0600 `~/.pgpass` or environment
+  variables. Never put passwords in YAML, SQL, commands, or shell history.
+
+## Install once
+
+From the repository root, verify the tools and create the locked Python
+environment:
 
 ```bash
+command -v uv psql pgbench
 cd cutover-controller
 uv sync --locked
-uv run ./cutover --help
+cd ../labs
+../cutover-controller/.venv/bin/python --version
+psql --version
+pgbench --version
 ```
 
-## Pre-cutover connection checklist
+## Configure each lab run
 
-Run these checks with the exact database names, users, hosts, ports, and TLS
-settings planned for migration. Keep passwords in a mode-0600 `.pgpass` or
-environment variable; do not put them in commands, YAML, SQL, or shell
-history.
-
-### 1. Controller to both databases
-
-From the machine that will run the controller, test DNS/TCP first:
+Follow the database setup and replication instructions in
+[`labs/README.md`](labs/README.md), then create protected local configuration:
 
 ```bash
-pg_isready -h "$SOURCE_HOST" -p "$SOURCE_PORT" -d "$DATABASE"
-pg_isready -h "$TARGET_HOST" -p "$TARGET_PORT" -d "$DATABASE"
+cd labs
+mkdir -p local
+chmod 700 local
+cp config.example.env local/config.env
+cp cutover.example.yaml local/cutover.yaml
+chmod 600 local/config.env local/cutover.yaml
 ```
 
-Then prove SQL authentication, the selected database, server identity, and
-TLS settings:
+Edit both files with the real endpoints, users, database names, TLS paths,
+system identifiers, and password environment-variable names. `local/` is
+ignored by Git. Keep the controller's state in `.state/` and logs in `logs/`.
+
+## Run the rehearsal
+
+Run these commands from `labs/`. Define the controller shortcut once per
+shell:
 
 ```bash
-PGHOST="$SOURCE_HOST" PGPORT="$SOURCE_PORT" PGUSER="$SOURCE_USER" \
-PGDATABASE="$DATABASE" PGSSLMODE="$SOURCE_SSLMODE" \
-psql -X -v ON_ERROR_STOP=1 -c \
-"SELECT current_database(), current_user, current_setting('server_version'),
-        pg_is_in_recovery(), (pg_control_system()).system_identifier;"
-
-PGHOST="$TARGET_HOST" PGPORT="$TARGET_PORT" PGUSER="$TARGET_USER" \
-PGDATABASE="$DATABASE" PGSSLMODE="$TARGET_SSLMODE" \
-psql -X -v ON_ERROR_STOP=1 -c \
-"SELECT current_database(), current_user, current_setting('server_version'),
-        pg_is_in_recovery(), (pg_control_system()).system_identifier;"
+cutover() {
+  ../cutover-controller/.venv/bin/python ../cutover-controller/cutover \
+    --config local/cutover.yaml \
+    --state-file .state/cutover-state.yaml \
+    --logs-dir logs "$@"
+}
 ```
 
-For `verify-ca` or `verify-full`, also set the matching
-`PGSSLROOTCERT`. Use `\conninfo` in `psql` to confirm the negotiated
-connection. Stop if the database is wrong, either server is a standby, the
-identifiers are equal, or certificate verification fails.
-
-### 2. Replication prerequisites
-
-On each publisher, verify:
-
-```sql
-SELECT name, setting
-FROM pg_settings
-WHERE name IN (
-  'wal_level',
-  'max_replication_slots',
-  'max_wal_senders',
-  'max_logical_replication_workers',
-  'max_sync_workers_per_subscription',
-  'max_worker_processes'
-)
-ORDER BY name;
-```
-
-Confirm `wal_level=logical`, reserve capacity for every database, and test
-the exact replication-role credentials from the controller machine.
-
-### 3. Both server-to-server directions
-
-Controller connectivity is not enough. Before the production window, use a
-disposable database to create and remove an actual publication, subscription,
-and slot in both directions:
-
-- target subscriber -> source publisher, matching the forward path;
-- source subscriber -> target publisher, matching the rollback path.
-
-For each direction, require all of the following:
-
-- subscription creation completes within the planned timeout;
-- the publisher slot exists and becomes active;
-- every subscribed relation reaches `ready`;
-- a disposable insert reaches the subscriber;
-- the subscription can be disabled without leaving an active worker;
-- cleanup removes only the named test subscription, slot, and publication.
-
-Use the lab's reviewed helpers and procedure in
-[`labs/README.md`](labs/README.md) rather than improvising against
-production data. A successful connection from a laptop proves only the
-laptop's firewall rule. Cloud allowlists must permit the database server's
-actual egress address in each direction.
-
-### 4. Controller gate
-
-After the connection rehearsal and production logical-replication setup, run:
+Start source traffic and wait for the initial copy:
 
 ```bash
-cd cutover-controller
-uv run ./cutover --config ../labs/local/cutover.yaml precheck
+./appctl check
+./appctl point source
+./appctl start
+./appctl status
+cutover inventory
+cutover precheck
 ```
 
-Proceed only when every configured database reports `READY=YES`, all table
-states are ready, lag and error counters are acceptable, capacity has
-reserve, and the observed system identifiers match the reviewed
-configuration.
+Do not continue until every configured database and subscription relation is
+healthy.
+
+## Cut over to the target
+
+Freeze writes externally, then keep them frozen through reverse replication:
+
+```bash
+./appctl stop
+./validate
+cutover precheck
+cutover capture-lsn --confirm-source-writes-frozen
+cutover wait-catchup --timeout 1800
+cutover disable-forward
+cutover sync-sequences
+cutover prepare-reverse
+cutover enable-reverse
+./appctl point target
+./appctl start
+cutover confirm-cutover --confirm-target-only-writable
+cutover verify-reverse --test
+```
+
+Only release target writes after `enable-reverse` succeeds. The controller
+records checkpoints but cannot make the multi-database operation atomic.
+
+## Roll back to the source
+
+If rollback is required, stop target writes and run:
+
+```bash
+./appctl stop
+cutover rollback-precheck --confirm-target-writes-frozen --timeout 1800
+cutover rollback
+./appctl point source
+./appctl start
+./appctl status
+```
+
+Validate the source and first post-rollback transfer before resuming normal
+traffic. For irreversible cleanup, read the finalization procedure in
+[`cutover-controller/README.md`](cutover-controller/README.md) and do not run
+it until the rollback window is explicitly abandoned.
+
+## If a command fails
+
+Keep writes frozen. Correct the reported database or replication issue, then
+rerun the failed operation with `--resume` when the controller suggests it.
+Do not delete the state file during an active rehearsal; it contains the
+checkpoints needed to recover safely.
+
+## Local checks
+
+These checks do not contact PostgreSQL:
+
+```bash
+(cd labs && bash -n appctl validate tests/test_appctl.sh && ./tests/test_appctl.sh)
+(cd cutover-controller && .venv/bin/python -m unittest discover -s tests -v)
+```
