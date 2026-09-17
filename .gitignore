@@ -11,10 +11,9 @@
 !/cutover-controller/logs/.gitkeep
 
 # Lab runtime data
+/labs/local/
 /labs/.state/
 
 # Python test and interpreter artifacts
 **/__pycache__/
 *.py[cod]
-
-/local
