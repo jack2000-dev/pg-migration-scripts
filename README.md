@@ -126,9 +126,23 @@ cutover rollback
 ```
 
 Validate the source and first post-rollback transfer before resuming normal
-traffic. For irreversible cleanup, read the finalization procedure in
-[`cutover-controller/README.md`](cutover-controller/README.md) and do not run
-it until the rollback window is explicitly abandoned.
+traffic.
+
+## Close the migration
+
+After accepting either the cutover or rollback and deciding that no further
+incremental switch is required, remove the dedicated subscriptions, slots, and
+publications:
+
+```bash
+cutover finalize --plan
+cutover finalize --execute --confirm-cleanup --dry-run
+cutover finalize --execute --confirm-cleanup
+```
+
+This releases slot-based WAL retention. A later direction change requires a new
+full synchronization. Read the complete safety procedure in
+[`cutover-controller/README.md`](cutover-controller/README.md) first.
 
 ## If a command fails
 

@@ -440,7 +440,7 @@ class Controller:
             use_reverse = phase in {
                 "REVERSE_PREPARED", "REVERSE_ACTIVE", "CUTOVER_COMPLETE",
                 "ROLLBACK_WRITES_FROZEN", "ROLLBACK_LSN_CAPTURED",
-                "ROLLBACK_CAUGHT_UP", "ROLLBACK_SEQUENCES_SYNCED", "ROLLED_BACK",
+                "ROLLBACK_CAUGHT_UP", "ROLLBACK_SEQUENCES_SYNCED",
             }
             reverse_active = phase in {
                 "REVERSE_ACTIVE", "CUTOVER_COMPLETE", "ROLLBACK_WRITES_FROZEN",
@@ -451,7 +451,7 @@ class Controller:
                     db, require_active=reverse_active
                 )
                 slot = publisher.get("slot") or {}
-            elif phase in {"FORWARD_DISABLED", "SEQUENCES_SYNCED"}:
+            elif phase in {"FORWARD_DISABLED", "SEQUENCES_SYNCED", "ROLLED_BACK"}:
                 problems = self._forward_disabled_problems(db)
                 subscriber = self._target_info(db)
                 publisher = self._source_info(db, self._forward_slot(db, subscriber))
@@ -529,8 +529,8 @@ class Controller:
                 hints = {
                     "capture-lsn": "./cutover capture-lsn --confirm-source-writes-frozen --resume",
                     "rollback-precheck": "./cutover rollback-precheck --confirm-target-writes-frozen --resume",
-                    "finalize-disable": "./cutover finalize --execute --confirm-no-rollback --resume",
-                    "finalize": "./cutover finalize --execute --confirm-no-rollback --resume",
+                    "finalize-disable": "./cutover finalize --execute --confirm-cleanup --resume",
+                    "finalize": "./cutover finalize --execute --confirm-cleanup --resume",
                 }
                 print(f"Resume with: {hints.get(command, f'./cutover {command} --resume')}")
                 raise PartialFailure(f"{command} failed for {db.name}: {exc}") from exc
@@ -1382,7 +1382,12 @@ class Controller:
         }
 
     def finalize_plan(self, as_json: bool = False) -> dict[str, Any]:
-        plan = {"warning": "Executing this plan permanently removes rollback replication.", "databases": []}
+        plan = {
+            "warning": "Executing this plan permanently removes incremental switching capability; "
+                       "another direction change requires full resynchronization.",
+            "writer": self.state.data["writer"],
+            "databases": [],
+        }
         for db in self.config.databases:
             self.source.validate_identity(db.name)
             self.target.validate_identity(db.name)
@@ -1398,17 +1403,22 @@ class Controller:
         if as_json:
             emit(plan, True)
         else:
-            print("WARNING: FINALIZATION PERMANENTLY REMOVES ROLLBACK CAPABILITY")
+            print("WARNING: FINALIZATION PERMANENTLY REMOVES INCREMENTAL SWITCHING CAPABILITY")
             for item in plan["databases"]:
                 print(f"{item['database']}: disable={item['disable']} drop_subscriptions={item['drop_subscriptions']} drop_publications={item['drop_publications']} slots={item['associated_slots']}")
         return plan
 
     def finalize_execute(self, confirmed: bool, resume: bool, dry_run: bool) -> None:
         if not confirmed:
-            raise ControllerError("finalize --execute requires --confirm-no-rollback")
-        if self.state.data["writer"] != "target":
-            raise ControllerError("finalization is allowed only for an accepted cutover with TARGET as writer")
-        self._require_phases("finalize", {"CUTOVER_COMPLETE", "FINALIZED"})
+            raise ControllerError("finalize --execute requires --confirm-cleanup")
+        writer = self.state.data["writer"]
+        allowed = {
+            "target": {"CUTOVER_COMPLETE", "FINALIZED"},
+            "source": {"ROLLED_BACK", "FINALIZED"},
+        }.get(writer)
+        if not allowed:
+            raise ControllerError("finalization requires SOURCE or TARGET to be the recorded writer")
+        self._require_phases("finalize", allowed)
         self._validate_batch_identities()
         self.finalize_plan()
         for db in self.config.databases:

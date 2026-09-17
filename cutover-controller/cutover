@@ -84,7 +84,9 @@ def parser() -> argparse.ArgumentParser:
     mode = finalize.add_mutually_exclusive_group(required=True)
     mode.add_argument("--plan", action="store_true")
     mode.add_argument("--execute", action="store_true")
-    finalize.add_argument("--confirm-no-rollback", action="store_true")
+    finalize.add_argument(
+        "--confirm-cleanup", "--confirm-no-rollback", dest="confirm_cleanup", action="store_true"
+    )
     finalize.add_argument("--dry-run", action="store_true")
     finalize.add_argument("--resume", action="store_true")
     finalize.add_argument("--json", action="store_true")
@@ -156,7 +158,7 @@ def main() -> int:
             elif command == "finalize" and args.plan:
                 controller.finalize_plan(args.json)
             elif command == "finalize" and args.execute:
-                controller.finalize_execute(args.confirm_no_rollback, args.resume, args.dry_run)
+                controller.finalize_execute(args.confirm_cleanup, args.resume, args.dry_run)
             logger.info("command=%s status=complete", command)
         return 0
     except ConfigError as exc:

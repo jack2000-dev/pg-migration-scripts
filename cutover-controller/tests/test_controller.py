@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from lib.config import Config, ConfigError, Database, Endpoint
-from lib.controller import Controller, PartialFailure, _type_lossless, lsn_int
+from lib.controller import Controller, ControllerError, PartialFailure, _type_lossless, lsn_int
 from lib.pg import PostgreSQLError, Psql, libpq_value, qualified, quote_ident, quote_literal
 from lib.state import StateError, StateStore
 
@@ -386,10 +386,60 @@ class StateAndBatchTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "writes to remain frozen"):
             self.controller.rollback(True, False)
 
-    def test_finalize_detaches_slots_before_dropping_subscriptions(self) -> None:
+    def test_rolled_back_status_reports_forward_slot(self) -> None:
         for db in self.config.databases:
-            self.state.set_phase(db.name, "CUTOVER_COMPLETE")
-        self.state.data["writer"] = "target"
+            self.state.set_phase(db.name, "ROLLED_BACK")
+        self.state.data["writer"] = "source"
+        subscriber = {"stats": {"apply_error_count": 0, "sync_error_count": 0}}
+        publisher = {"slot": {
+            "slot_name": "forward_slot", "active": False,
+            "lag_bytes": 4_000_000_000, "retained_bytes": 4_100_000_000,
+        }}
+        with (
+            patch.object(self.controller.source, "validate_identity"),
+            patch.object(self.controller.target, "validate_identity"),
+            patch.object(self.controller, "_forward_disabled_problems", return_value=[]),
+            patch.object(self.controller, "_target_info", return_value=subscriber),
+            patch.object(self.controller, "_forward_slot", return_value="forward_slot"),
+            patch.object(self.controller, "_source_info", return_value=publisher),
+            patch.object(self.controller, "_reverse_status") as reverse_status,
+            patch("lib.controller.emit") as emit,
+        ):
+            self.controller.status(True)
+
+        reverse_status.assert_not_called()
+        payload = emit.call_args.args[0]
+        self.assertEqual(payload["databases"][0]["slot"]["retained_bytes"], 4_100_000_000)
+
+    def test_finalize_accepts_both_terminal_writers(self) -> None:
+        for writer, phase in (("target", "CUTOVER_COMPLETE"), ("source", "ROLLED_BACK")):
+            with self.subTest(writer=writer, phase=phase):
+                for db in self.config.databases:
+                    self.state.set_phase(db.name, phase)
+                self.state.data["writer"] = writer
+                with (
+                    patch.object(self.controller, "_validate_batch_identities"),
+                    patch.object(self.controller, "finalize_plan"),
+                    patch.object(self.controller, "_cleanup_preflight"),
+                ):
+                    self.controller.finalize_execute(True, False, True)
+
+    def test_finalize_rejects_mismatched_writer_and_phase(self) -> None:
+        for writer, phase in (("source", "CUTOVER_COMPLETE"), ("target", "ROLLED_BACK")):
+            with self.subTest(writer=writer, phase=phase):
+                for db in self.config.databases:
+                    self.state.set_phase(db.name, phase)
+                self.state.data["writer"] = writer
+                with self.assertRaisesRegex(ControllerError, "invalid for phase"):
+                    self.controller.finalize_execute(True, False, True)
+        self.state.data["writer"] = "none"
+        with self.assertRaisesRegex(ControllerError, "recorded writer"):
+            self.controller.finalize_execute(True, False, True)
+
+    def test_finalize_after_rollback_detaches_slots_before_dropping_subscriptions(self) -> None:
+        for db in self.config.databases:
+            self.state.set_phase(db.name, "ROLLED_BACK")
+        self.state.data["writer"] = "source"
         subscriptions: dict[tuple[str, bool], dict[str, object] | None] = {}
         for db in self.config.databases:
             subscriptions[(db.name, False)] = {
@@ -483,6 +533,13 @@ class EntrypointTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("wait-catchup", completed.stdout)
+        finalize = subprocess.run(
+            [str(ROOT / "cutover"), "finalize", "--help"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(finalize.returncode, 0, finalize.stderr)
+        self.assertIn("--confirm-cleanup", finalize.stdout)
+        self.assertIn("--confirm-no-rollback", finalize.stdout)
 
 if __name__ == "__main__":
     unittest.main()

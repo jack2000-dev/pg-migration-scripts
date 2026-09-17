@@ -47,6 +47,7 @@ CUTOVER_COMPLETE
   -> ROLLED_BACK
 
 CUTOVER_COMPLETE -> FINALIZED
+ROLLED_BACK -> FINALIZED
 ~~~
 
 The reverse slot is created before NEW accepts writes. Creating it afterward would omit transactions committed before the slot creation point.
@@ -357,23 +358,26 @@ Success means reverse subscriptions are disabled and connection strings may be m
 
 ## 11. Final cleanup procedure
 
-Finalization is available only after an accepted cutover with TARGET recorded as writer.
+Finalization is available after either an accepted cutover with TARGET as writer or a completed rollback with SOURCE as writer. It permanently removes both incremental replication paths; another direction change requires a new full synchronization.
 
 ~~~bash
 ./cutover finalize --plan
+./cutover finalize --execute --confirm-cleanup --dry-run
 ~~~
 
-After formal rollback-window closure:
+After formally closing the migration attempt:
 
 ~~~bash
-./cutover finalize --execute --confirm-no-rollback
+./cutover finalize --execute --confirm-cleanup
 ~~~
 
-Execution preflights every named publication, subscription, relation manifest, and slot before deletion, then disables and verifies all subscriptions. It detaches each subscription with `slot_name = NONE`, drops the local subscription, explicitly verifies and drops only the expected inactive logical `pgoutput` slot on the expected database, and finally drops the dedicated publications. This keeps cleanup resumable even when the remote publisher is unavailable. For partial cleanup:
+Execution preflights every named publication, subscription, relation manifest, and slot before deletion, then disables and verifies all subscriptions. It detaches each subscription with `slot_name = NONE`, drops the local subscription, explicitly verifies and drops only the expected inactive logical `pgoutput` slot on the expected database, and finally drops the dedicated publications. Dropped slots stop reserving WAL; PostgreSQL may reuse the files instead of immediately reducing visible disk use. This keeps cleanup resumable even when the remote publisher is unavailable. For partial cleanup:
 
 ~~~bash
-./cutover finalize --execute --confirm-no-rollback --resume
+./cutover finalize --execute --confirm-cleanup --resume
 ~~~
+
+`--confirm-no-rollback` remains accepted as a compatibility alias for `--confirm-cleanup`.
 
 Never delete from PostgreSQL system catalogs or manually alter replication-origin rows.
 
@@ -436,7 +440,7 @@ Exit codes:
 - Do not reset subscription statistics during an observation window.
 - Freeze relevant DDL throughout the rollback window.
 - Watch retained WAL and safe_wal_size, especially while a reverse slot is inactive.
-- Treat --ignore-missing, --force, and --confirm-no-rollback as exceptional actions and record why they were used.
+- Treat --ignore-missing, --force, and --confirm-cleanup as exceptional actions and record why they were used.
 - Back up the mode-0600 state file and logs with the change record.
 - Read the complete finalize plan. Cleanup cannot be globally atomic across databases.
 

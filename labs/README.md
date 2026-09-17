@@ -383,4 +383,7 @@ bash -n appctl validate tests/test_appctl.sh
 
 Generator logs are in `.state/logs/`, controller logs are in `logs/`, and
 controller state is `.state/cutover-state.yaml`. Keep the state file for
-`--resume`; use a fresh lab and state file for irreversible `finalize` drills.
+`--resume`. After accepting either the cutover or rollback, run
+`cutover_lab finalize --plan` before the irreversible
+`cutover_lab finalize --execute --confirm-cleanup`; use a fresh lab and state
+file for another rehearsal.
