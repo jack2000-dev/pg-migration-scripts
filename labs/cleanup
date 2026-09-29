@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CONFIG=${LAB_CONFIG:-"$ROOT/local/config.env"}
+SECRETS=${LAB_SECRETS:-"$ROOT/local/secrets.env"}
+APPCTL=${LAB_APPCTL:-"$ROOT/appctl"}
+CONTROLLER_PY=${CUTOVER_PYTHON:-"$ROOT/../cutover-controller/.venv/bin/python"}
+CONTROLLER=${CUTOVER_CLI:-"$ROOT/../cutover-controller/cutover"}
+CONTROLLER_CONFIG=${CUTOVER_CONFIG_FILE:-"$ROOT/local/cutover.yaml"}
+LOGS_DIR=${CUTOVER_LOGS_DIR:-"$ROOT/logs"}
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    printf 'usage: %s [--resume]\n' "$0"
+}
+
+resume=()
+case ${1:-} in
+    '') ;;
+    --resume) resume=(--resume) ;;
+    --help|-h) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+esac
+
+umask 077
+[[ -r "$CONFIG" ]] || die "missing config: $CONFIG"
+set -a
+# shellcheck disable=SC1090
+source "$CONFIG"
+set +a
+: "${LAB_DATABASES:?LAB_DATABASES is required}"
+
+IFS=',' read -r -a databases <<< "$LAB_DATABASES"
+(("${#databases[@]}" > 0)) || die "LAB_DATABASES is empty"
+for database in "${databases[@]}"; do
+    [[ "$database" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || die "unsafe database name: $database"
+done
+
+state_root=$(realpath -m "$ROOT/.state")
+state_value=${CUTOVER_STATE_FILE:-.state/cutover-state.yaml}
+if [[ "$state_value" == /* ]]; then
+    state_candidate=$state_value
+else
+    state_candidate="$ROOT/$state_value"
+fi
+[[ -f "$state_candidate" ]] || die "missing state file: $state_candidate"
+state_file=$(realpath -e "$state_candidate")
+[[ "$state_file" == "$state_root/"* ]] || die "state file must be inside $state_root"
+
+[[ -r "$SECRETS" ]] || die "missing secrets: $SECRETS"
+secret_mode=$(stat -c '%a' "$SECRETS")
+(( (8#$secret_mode & 077) == 0 )) || die "secrets file permissions are too broad: $SECRETS"
+set -a
+# shellcheck disable=SC1090
+source "$SECRETS"
+set +a
+
+[[ -x "$APPCTL" ]] || die "appctl is not executable: $APPCTL"
+[[ -x "$CONTROLLER_PY" ]] || die "controller Python is not executable: $CONTROLLER_PY"
+[[ -r "$CONTROLLER" ]] || die "controller entrypoint is not readable: $CONTROLLER"
+[[ -r "$CONTROLLER_CONFIG" ]] || die "missing controller config: $CONTROLLER_CONFIG"
+
+app_status=$(LAB_CONFIG="$CONFIG" "$APPCTL" status)
+printf '%s\n' "$app_status"
+[[ "$app_status" != *" RUNNING"* ]] || die "stop every appctl worker before cleanup"
+
+command=(
+    "$CONTROLLER_PY" "$CONTROLLER"
+    --config "$CONTROLLER_CONFIG"
+    --state-file "$state_file"
+    --logs-dir "$LOGS_DIR"
+)
+
+"${command[@]}" finalize --plan
+"${command[@]}" finalize --execute --confirm-cleanup --dry-run "${resume[@]}"
+
+[[ -t 0 && -t 1 ]] || die "cleanup confirmation requires an interactive terminal"
+printf '\nWARNING: This permanently drops the configured logical-replication\n' >&2
+printf 'subscriptions, replication slots, and publications for: %s\n' "$LAB_DATABASES" >&2
+printf 'It does not drop databases, schemas, tables, roles, or table data.\n' >&2
+printf 'A future rehearsal will require a fresh initial synchronization.\n' >&2
+printf "Type '%s' to confirm cleanup: " "$LAB_DATABASES" >&2
+IFS= read -r confirmation
+[[ "$confirmation" == "$LAB_DATABASES" ]] || die "confirmation did not match"
+
+"${command[@]}" finalize --execute --confirm-cleanup "${resume[@]}"
+"${command[@]}" status
+printf 'cleanup complete; a future rehearsal requires fresh logical replication\n'
