@@ -376,14 +376,16 @@ setup, cutover, rollback, or saved SQL containing credentials.
 These checks do not connect to a database:
 
 ```bash
-bash -n appctl validate tests/test_appctl.sh
+bash -n appctl cleanup validate tests/test_appctl.sh tests/test_cleanup.sh
 ./tests/test_appctl.sh
+./tests/test_cleanup.sh
 (cd ../cutover-controller && uv run python -m unittest discover -s tests -v)
 ```
 
 Generator logs are in `.state/logs/`, controller logs are in `logs/`, and
-controller state is `.state/cutover-state.yaml`. Keep the state file for
-`--resume`. After accepting either the cutover or rollback, run
-`cutover_lab finalize --plan` before the irreversible
-`cutover_lab finalize --execute --confirm-cleanup`; use a fresh lab and state
-file for another rehearsal.
+the active controller state is selected by `CUTOVER_STATE_FILE`. Keep the
+state file for `--resume`. After accepting either the cutover or rollback,
+run `./cleanup`; it shows the plan, runs a dry-run, and requires typing the
+configured database list before removing the replication objects. If a
+partial cleanup reports that it is resumable, run `./cleanup --resume`.
+Use a fresh lab and state file for another rehearsal.

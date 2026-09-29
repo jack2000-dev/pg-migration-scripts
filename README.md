@@ -135,13 +135,14 @@ incremental switch is required, remove the dedicated subscriptions, slots, and
 publications:
 
 ```bash
-cutover finalize --plan
-cutover finalize --execute --confirm-cleanup --dry-run
-cutover finalize --execute --confirm-cleanup
+cd labs
+./cleanup
 ```
 
-This releases slot-based WAL retention. A later direction change requires a new
-full synchronization. Read the complete safety procedure in
+The command checks that the generator is stopped, shows the cleanup plan,
+runs a dry-run, and requires typing the configured database list before
+execution. This releases slot-based WAL retention. A later direction change
+requires a new full synchronization. Read the complete safety procedure in
 [`cutover-controller/README.md`](cutover-controller/README.md) first.
 
 ## If a command fails
